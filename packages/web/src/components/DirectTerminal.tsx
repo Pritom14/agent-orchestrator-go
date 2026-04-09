@@ -337,8 +337,8 @@ export function DirectTerminal({
         terminal.open(terminalRef.current);
         terminalInstance.current = terminal;
 
-        // Fit terminal to container
-        fit.fit();
+        // Fit terminal to container — defer so DOM has settled
+        requestAnimationFrame(() => fit.fit());
 
         // Runtime WS config cache. We do not rely on build-time NEXT_PUBLIC_* here
         // because `ao start` can choose terminal ports dynamically at runtime.
@@ -404,8 +404,7 @@ export function DirectTerminal({
           return true;
         });
 
-        // Handle window resize (works with whatever ws is current)
-        const handleResize = () => {
+        const resizeObserver = new ResizeObserver(() => {
           const currentWs = ws.current;
           if (fit && currentWs?.readyState === WebSocket.OPEN) {
             fit.fit();
@@ -417,9 +416,8 @@ export function DirectTerminal({
               }),
             );
           }
-        };
-
-        window.addEventListener("resize", handleResize);
+        });
+        resizeObserver.observe(terminalRef.current);
 
         // Terminal input → current WebSocket
         inputDisposable = terminal.onData((data) => {
@@ -550,7 +548,7 @@ export function DirectTerminal({
         cleanup = () => {
           selectionDisposable.dispose();
           if (safetyTimer) clearTimeout(safetyTimer);
-          window.removeEventListener("resize", handleResize);
+          resizeObserver.disconnect();
           inputDisposable?.dispose();
           inputDisposable = null;
           if (reconnectTimerRef.current) {
@@ -811,7 +809,7 @@ export function DirectTerminal({
       {/* Terminal area */}
       <div
         ref={terminalRef}
-        className={cn("w-full p-1.5")}
+        className={cn("w-full")}
         style={{
           overflow: "hidden",
           display: "flex",
