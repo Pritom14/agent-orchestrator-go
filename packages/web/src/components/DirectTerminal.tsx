@@ -338,7 +338,7 @@ export function DirectTerminal({
         terminalInstance.current = terminal;
 
         // Fit terminal to container — defer so DOM has settled
-        requestAnimationFrame(() => fit.fit());
+        const initialFitRafId = requestAnimationFrame(() => fit.fit());
 
         // Runtime WS config cache. We do not rely on build-time NEXT_PUBLIC_* here
         // because `ao start` can choose terminal ports dynamically at runtime.
@@ -546,6 +546,7 @@ export function DirectTerminal({
 
         // Store cleanup function to be called from useEffect cleanup
         cleanup = () => {
+          cancelAnimationFrame(initialFitRafId);
           selectionDisposable.dispose();
           if (safetyTimer) clearTimeout(safetyTimer);
           resizeObserver.disconnect();
