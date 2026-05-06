@@ -207,6 +207,7 @@ import { GET as eventsGET } from "@/app/api/events/route";
 import { GET as observabilityGET } from "@/app/api/observability/route";
 import { GET as runtimeTerminalGET } from "@/app/api/runtime/terminal/route";
 import { GET as verifyGET, POST as verifyPOST } from "@/app/api/verify/route";
+import { GET as statusGET } from "@/app/api/status/route";
 
 function makeRequest(url: string, init?: RequestInit): NextRequest {
   return new NextRequest(
@@ -980,6 +981,31 @@ describe("API Routes", () => {
       expect(res.status).toBe(400);
       const data = await res.json();
       expect(data.error).toMatch(/Invalid JSON body/);
+    });
+  });
+
+  // ── GET /api/status ────────────────────────────────────────────────
+
+  describe("GET /api/status", () => {
+    it("returns 200 with status ok", async () => {
+      const res = await statusGET();
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.status).toBe("ok");
+    });
+
+    it("returns uptime as a non-negative number", async () => {
+      const res = await statusGET();
+      const data = await res.json();
+      expect(typeof data.uptime).toBe("number");
+      expect(data.uptime).toBeGreaterThanOrEqual(0);
+    });
+
+    it("returns version string from package.json", async () => {
+      const res = await statusGET();
+      const data = await res.json();
+      expect(typeof data.version).toBe("string");
+      expect(data.version).toMatch(/^\d+\.\d+\.\d+/);
     });
   });
 });
