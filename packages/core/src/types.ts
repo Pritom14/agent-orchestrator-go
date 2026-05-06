@@ -85,6 +85,68 @@ export interface ActivityLogEntry {
 /** Default threshold (ms) before a "ready" session becomes "idle". */
 export const DEFAULT_READY_THRESHOLD_MS = 300_000; // 5 minutes
 
+// =============================================================================
+// ACTIVITY EVENTS
+// =============================================================================
+
+/** A session transitioned from one status to another. */
+export interface StatusChangeEvent {
+  type: "status_change";
+  ts: number;
+  sessionId: SessionId;
+  projectId: string;
+  from: SessionStatus;
+  to: SessionStatus;
+}
+
+/** A message was sent to the agent session (via a reaction or direct send). */
+export interface MessageSentEvent {
+  type: "message_sent";
+  ts: number;
+  sessionId: SessionId;
+  projectId: string;
+  message: string;
+}
+
+/** A tool call was detected in the agent's terminal output (best-effort). */
+export interface ToolCallEvent {
+  type: "tool_call";
+  ts: number;
+  sessionId: SessionId;
+  projectId: string;
+  /** Best-effort tool name extracted from terminal output, or "unknown". */
+  tool: string;
+}
+
+/** A CI check result was received from the SCM. */
+export interface CIResultEvent {
+  type: "ci_result";
+  ts: number;
+  sessionId: SessionId;
+  projectId: string;
+  /** Raw CI status string (e.g. "passing", "failing", "pending"). */
+  status: string;
+  /** Optional list of failed check names when available. */
+  checks?: string[];
+}
+
+/** A review comment was forwarded to the agent session. */
+export interface ReviewCommentEvent {
+  type: "review_comment";
+  ts: number;
+  sessionId: SessionId;
+  projectId: string;
+  message: string;
+}
+
+/** Union of all observable lifecycle activity events. */
+export type ActivityEvent =
+  | StatusChangeEvent
+  | MessageSentEvent
+  | ToolCallEvent
+  | CIResultEvent
+  | ReviewCommentEvent;
+
 /** Default window (ms) for "active" state — activity newer than this is "active", older is "ready". */
 export const DEFAULT_ACTIVE_WINDOW_MS = 30_000; // 30 seconds
 

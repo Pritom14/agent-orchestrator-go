@@ -113,6 +113,9 @@ export {
   recordTerminalActivity,
 } from "./activity-log.js";
 
+// Event log — in-memory ring buffer for lifecycle activity events
+export { activityLog } from "./event-log.js";
+
 // Agent workspace hooks — shared PATH-wrapper setup for non-Claude agents
 export {
   setupPathWrapperWorkspace,

@@ -40,6 +40,8 @@ import { updateMetadata } from "./metadata.js";
 import { getSessionsDir } from "./paths.js";
 import { createCorrelationId, createProjectObserver } from "./observability.js";
 import { resolveAgentSelection, resolveSessionRole } from "./agent-selection.js";
+import { activityLog } from "./event-log.js";
+import type { ActivityEvent } from "./types.js";
 
 /** Parse a duration string like "10m", "30s", "1h" to milliseconds. */
 function parseDuration(str: string): number {
@@ -174,6 +176,37 @@ function transitionLogLevel(status: SessionStatus): "info" | "warn" | "error" {
     return "warn";
   }
   return "info";
+}
+
+/** Extract a best-effort tool name from raw terminal output. */
+function parseBestEffortTool(output: string): string {
+  const patterns = [
+    /\bRunning\s+(\w+)/i,
+    /\bExecuting\s+(\w+)/i,
+    /\bTool:\s*(\w+)/i,
+    /^\$\s+(\S+)/m,
+  ];
+  for (const pattern of patterns) {
+    const match = output.match(pattern);
+    if (match?.[1]) return match[1];
+  }
+  return "unknown";
+}
+
+/** Push an ActivityEvent without throwing — log a warning on error. */
+function pushActivity(event: ActivityEvent): void {
+  try {
+    activityLog.push(event);
+  } catch (err) {
+    process.stderr.write(
+      JSON.stringify({
+        source: "ao-lifecycle-manager",
+        level: "warn",
+        message: `activityLog.push failed: ${err instanceof Error ? err.message : String(err)}`,
+        timestamp: new Date().toISOString(),
+      }) + "\n",
+    );
+  }
 }
 
 export interface LifecycleManagerDeps {
@@ -423,6 +456,16 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             const activity = agent.detectActivity(terminalOutput);
             if (activity === "waiting_input") return "needs_input";
 
+            if (activity === "active") {
+              pushActivity({
+                type: "tool_call",
+                ts: Date.now(),
+                sessionId: session.id,
+                projectId: session.projectId,
+                tool: parseBestEffortTool(terminalOutput),
+              });
+            }
+
             const processAlive = await agent.isProcessRunning(session.runtimeHandle);
             if (!processAlive) return "killed";
           }
@@ -513,6 +556,13 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
         // Check CI
         const ciStatus = await scm.getCISummary(session.pr);
+        pushActivity({
+          type: "ci_result",
+          ts: Date.now(),
+          sessionId: session.id,
+          projectId: session.projectId,
+          status: ciStatus,
+        });
         if (ciStatus === CI_STATUS.FAILING) return "ci_failed";
 
         // Check reviews
@@ -623,6 +673,13 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         if (reactionConfig.message) {
           try {
             await sessionManager.send(sessionId, reactionConfig.message);
+            pushActivity({
+              type: "message_sent",
+              ts: Date.now(),
+              sessionId,
+              projectId,
+              message: reactionConfig.message,
+            });
 
             return {
               reactionType: reactionKey,
@@ -851,6 +908,13 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             reactionConfig,
           );
           if (result.success) {
+            pushActivity({
+              type: "review_comment",
+              ts: Date.now(),
+              sessionId: session.id,
+              projectId: session.projectId,
+              message: reactionConfig.message ?? "",
+            });
             updateSessionMetadata(session, {
               lastPendingReviewDispatchHash: pendingFingerprint,
               lastPendingReviewDispatchAt: new Date().toISOString(),
@@ -897,6 +961,13 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             reactionConfig,
           );
           if (result.success) {
+            pushActivity({
+              type: "review_comment",
+              ts: Date.now(),
+              sessionId: session.id,
+              projectId: session.projectId,
+              message: reactionConfig.message ?? "",
+            });
             updateSessionMetadata(session, {
               lastAutomatedReviewDispatchHash: automatedFingerprint,
               lastAutomatedReviewDispatchAt: new Date().toISOString(),
@@ -1196,6 +1267,14 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       // State transition detected
       states.set(session.id, newStatus);
       updateSessionMetadata(session, { status: newStatus });
+      pushActivity({
+        type: "status_change",
+        ts: Date.now(),
+        sessionId: session.id,
+        projectId: session.projectId,
+        from: oldStatus,
+        to: newStatus,
+      });
       observer.recordOperation({
         metric: "lifecycle_poll",
         operation: "lifecycle.transition",

@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createLifecycleManager } from "../lifecycle-manager.js";
 import { createSessionManager } from "../session-manager.js";
 import { writeMetadata, readMetadataRaw } from "../metadata.js";
+import { activityLog } from "../event-log.js";
 import type {
   OrchestratorConfig,
   PluginRegistry,
@@ -35,6 +36,7 @@ beforeEach(() => {
   mockRegistry = createMockRegistry({ runtime: plugins.runtime, agent: plugins.agent });
   mockSessionManager = createMockSessionManager();
   config = env.config;
+  activityLog.clear();
 });
 
 afterEach(() => {
@@ -1773,5 +1775,133 @@ describe("summary pinning", () => {
 
     // Should not throw — error is swallowed
     await expect(lm.check("app-1")).resolves.not.toThrow();
+  });
+});
+
+describe("activityLog integration", () => {
+  it("receives a status_change event after a session transitions state", async () => {
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "spawning" }),
+    });
+
+    await lm.check("app-1");
+
+    expect(lm.getStates().get("app-1")).toBe("working");
+
+    const events = activityLog.getAll();
+    const statusChangeEvents = events.filter((e) => e.type === "status_change");
+    expect(statusChangeEvents.length).toBeGreaterThanOrEqual(1);
+
+    const transition = statusChangeEvents.find(
+      (e) => e.type === "status_change" && e.to === "working",
+    );
+    expect(transition).toBeDefined();
+    expect(transition).toMatchObject({
+      type: "status_change",
+      sessionId: "app-1",
+      projectId: "my-app",
+      from: "spawning",
+      to: "working",
+    });
+  });
+
+  it("receives a ci_result event when CI check result is processed", async () => {
+    const mockSCM = createMockSCM({ getCISummary: vi.fn().mockResolvedValue("failing") });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makePR() }),
+      registry,
+    });
+
+    await lm.check("app-1");
+
+    expect(lm.getStates().get("app-1")).toBe("ci_failed");
+
+    const events = activityLog.getAll();
+    const ciEvents = events.filter((e) => e.type === "ci_result");
+    expect(ciEvents.length).toBeGreaterThanOrEqual(1);
+
+    const ciEvent = ciEvents[0];
+    expect(ciEvent).toMatchObject({
+      type: "ci_result",
+      sessionId: "app-1",
+      projectId: "my-app",
+      status: "failing",
+    });
+  });
+
+  it("receives a message_sent event when send-to-agent reaction fires", async () => {
+    config.reactions = {
+      "ci-failed": {
+        auto: true,
+        action: "send-to-agent",
+        message: "CI is failing. Fix it.",
+        retries: 2,
+        escalateAfter: 2,
+      },
+    };
+
+    const mockSCM = createMockSCM({ getCISummary: vi.fn().mockResolvedValue("failing") });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+
+    vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makePR() }),
+      registry,
+    });
+
+    await lm.check("app-1");
+
+    const events = activityLog.getAll();
+    const messageSentEvents = events.filter((e) => e.type === "message_sent");
+    expect(messageSentEvents.length).toBeGreaterThanOrEqual(1);
+
+    expect(messageSentEvents[0]).toMatchObject({
+      type: "message_sent",
+      sessionId: "app-1",
+      projectId: "my-app",
+      message: "CI is failing. Fix it.",
+    });
+  });
+
+  it("activityLog.getAll returns readonly events in order", async () => {
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "spawning" }),
+    });
+
+    await lm.check("app-1");
+
+    const events = activityLog.getAll();
+    expect(Array.isArray(events)).toBe(true);
+    expect(events.length).toBeGreaterThan(0);
+    // Events are ordered by insertion (ascending time)
+    for (let i = 1; i < events.length; i++) {
+      expect(events[i]!.ts).toBeGreaterThanOrEqual(events[i - 1]!.ts);
+    }
+  });
+
+  it("activityLog.getByProject filters by projectId", async () => {
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "spawning" }),
+    });
+
+    await lm.check("app-1");
+
+    const myAppEvents = activityLog.getByProject("my-app");
+    const otherEvents = activityLog.getByProject("other-project");
+
+    expect(myAppEvents.length).toBeGreaterThan(0);
+    expect(myAppEvents.every((e) => e.projectId === "my-app")).toBe(true);
+    expect(otherEvents.length).toBe(0);
   });
 });
