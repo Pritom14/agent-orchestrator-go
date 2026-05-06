@@ -12,7 +12,7 @@ const { mockGetAll, mockGetBySession, mockSize, mockPush } = vi.hoisted(() => ({
 }));
 
 vi.mock("@composio/ao-core", async (importOriginal) => {
-  const original = await importOriginal<typeof import("@composio/ao-core")>();
+  const original = (await importOriginal()) as Record<string, unknown>;
   return {
     ...original,
     activityLog: {
