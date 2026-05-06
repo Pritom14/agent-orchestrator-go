@@ -1904,4 +1904,150 @@ describe("activityLog integration", () => {
     expect(myAppEvents.every((e) => e.projectId === "my-app")).toBe(true);
     expect(otherEvents.length).toBe(0);
   });
+
+  it("receives a tool_call event when agent is active in terminal fallback path", async () => {
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue(null);
+    vi.mocked(plugins.agent.detectActivity).mockReturnValue("active" as ActivityState);
+    vi.mocked(plugins.agent.isProcessRunning).mockResolvedValue(true);
+    vi.mocked(plugins.runtime.getOutput).mockResolvedValue("Running Bash — ls -la\n");
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "working" }),
+    });
+
+    await lm.check("app-1");
+
+    const events = activityLog.getAll();
+    const toolCallEvents = events.filter((e) => e.type === "tool_call");
+    expect(toolCallEvents.length).toBeGreaterThanOrEqual(1);
+
+    const toolEvent = toolCallEvents[0];
+    expect(toolEvent).toMatchObject({
+      type: "tool_call",
+      sessionId: "app-1",
+      projectId: "my-app",
+    });
+    // parseBestEffortTool should extract "Bash" from "Running Bash"
+    expect(toolEvent).toHaveProperty("tool", "Bash");
+  });
+
+  it("tool_call event has tool=unknown when output has no parseable pattern", async () => {
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue(null);
+    vi.mocked(plugins.agent.detectActivity).mockReturnValue("active" as ActivityState);
+    vi.mocked(plugins.agent.isProcessRunning).mockResolvedValue(true);
+    vi.mocked(plugins.runtime.getOutput).mockResolvedValue("working on something...\n");
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "working" }),
+    });
+
+    await lm.check("app-1");
+
+    const events = activityLog.getAll();
+    const toolCallEvents = events.filter((e) => e.type === "tool_call");
+    expect(toolCallEvents.length).toBeGreaterThanOrEqual(1);
+    expect(toolCallEvents[0]).toHaveProperty("tool", "unknown");
+  });
+
+  it("receives a review_comment event when human review comments are dispatched", async () => {
+    config.reactions = {
+      "changes-requested": {
+        auto: true,
+        action: "send-to-agent",
+        message: "Please address the review comments.",
+      },
+    };
+
+    const mockSCM = createMockSCM({
+      getPendingComments: vi.fn().mockResolvedValue([
+        {
+          id: "c1",
+          author: "reviewer",
+          body: "Fix this",
+          path: "src/app.ts",
+          line: 5,
+          isResolved: false,
+          createdAt: new Date(),
+          url: "https://example.com/comment/1",
+        },
+      ]),
+      getAutomatedComments: vi.fn().mockResolvedValue([]),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+
+    vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makePR() }),
+      registry,
+    });
+
+    await lm.check("app-1");
+
+    const events = activityLog.getAll();
+    const reviewEvents = events.filter((e) => e.type === "review_comment");
+    expect(reviewEvents.length).toBeGreaterThanOrEqual(1);
+
+    expect(reviewEvents[0]).toMatchObject({
+      type: "review_comment",
+      sessionId: "app-1",
+      projectId: "my-app",
+      message: "Please address the review comments.",
+    });
+  });
+
+  it("receives a review_comment event when automated review comments are dispatched", async () => {
+    config.reactions = {
+      "bugbot-comments": {
+        auto: true,
+        action: "send-to-agent",
+        message: "Handle automated review findings.",
+      },
+    };
+
+    const mockSCM = createMockSCM({
+      getPendingComments: vi.fn().mockResolvedValue([]),
+      getAutomatedComments: vi.fn().mockResolvedValue([
+        {
+          id: "bot-1",
+          botName: "cursor[bot]",
+          body: "Potential issue detected",
+          path: "src/worker.ts",
+          line: 9,
+          severity: "warning",
+          createdAt: new Date(),
+          url: "https://example.com/comment/bot1",
+        },
+      ]),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+
+    vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makePR() }),
+      registry,
+    });
+
+    await lm.check("app-1");
+
+    const events = activityLog.getAll();
+    const reviewEvents = events.filter((e) => e.type === "review_comment");
+    expect(reviewEvents.length).toBeGreaterThanOrEqual(1);
+
+    expect(reviewEvents[0]).toMatchObject({
+      type: "review_comment",
+      sessionId: "app-1",
+      projectId: "my-app",
+      message: "Handle automated review findings.",
+    });
+  });
 });

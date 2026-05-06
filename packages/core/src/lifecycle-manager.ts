@@ -35,13 +35,13 @@ import {
   type ProjectConfig as _ProjectConfig,
   type PREnrichmentData,
   type CICheck,
+  type ActivityEvent,
 } from "./types.js";
 import { updateMetadata } from "./metadata.js";
 import { getSessionsDir } from "./paths.js";
 import { createCorrelationId, createProjectObserver } from "./observability.js";
 import { resolveAgentSelection, resolveSessionRole } from "./agent-selection.js";
 import { activityLog } from "./event-log.js";
-import type { ActivityEvent } from "./types.js";
 
 /** Parse a duration string like "10m", "30s", "1h" to milliseconds. */
 function parseDuration(str: string): number {
