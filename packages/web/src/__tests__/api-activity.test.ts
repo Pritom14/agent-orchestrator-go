@@ -180,6 +180,67 @@ describe("GET /api/activity", () => {
     expect(lines.length).toBeGreaterThan(0);
     expect(() => JSON.parse(lines[0]!.replace("data: ", ""))).not.toThrow();
   });
+
+  it("pushes new events that arrive after connect via the poll interval", async () => {
+    vi.useFakeTimers();
+    const initial = [makeEvent({ sessionId: "session-0" })];
+    const after = [...initial, makeEvent({ sessionId: "session-1" })];
+
+    mockGetAll.mockReturnValueOnce(initial).mockReturnValue(after);
+    mockSize.mockReturnValue(initial.length);
+
+    const res = await GET(makeRequest("http://localhost:3000/api/activity"));
+    const reader = res.body!.getReader();
+
+    // Read initial replay
+    const chunk1 = await reader.read();
+    const text1 = new TextDecoder().decode(chunk1.value);
+    expect(text1).toContain("session-0");
+
+    // Advance time to trigger the poll interval (2000ms)
+    await vi.advanceTimersByTimeAsync(2001);
+
+    // Read the polled event
+    const chunk2 = await reader.read();
+    const text2 = new TextDecoder().decode(chunk2.value);
+    expect(text2).toContain("session-1");
+
+    reader.cancel();
+    vi.useRealTimers();
+  });
+
+  it("sends a heartbeat comment after the heartbeat interval", async () => {
+    vi.useFakeTimers();
+    mockGetAll.mockReturnValue([]);
+    mockSize.mockReturnValue(0);
+
+    const res = await GET(makeRequest("http://localhost:3000/api/activity"));
+    const reader = res.body!.getReader();
+
+    // Advance past the heartbeat interval (15000ms)
+    await vi.advanceTimersByTimeAsync(15001);
+
+    const chunk = await reader.read();
+    const text = new TextDecoder().decode(chunk.value);
+    expect(text).toContain(": heartbeat");
+
+    reader.cancel();
+    vi.useRealTimers();
+  });
+
+  it("cleans up intervals when stream is cancelled", async () => {
+    vi.useFakeTimers();
+    mockGetAll.mockReturnValue([]);
+    mockSize.mockReturnValue(0);
+
+    const res = await GET(makeRequest("http://localhost:3000/api/activity"));
+    const reader = res.body!.getReader();
+    reader.cancel();
+
+    // Advance time — no errors should be thrown after cancel
+    await expect(vi.advanceTimersByTimeAsync(20000)).resolves.not.toThrow();
+    vi.useRealTimers();
+  });
 });
 
 describe("OPTIONS /api/activity", () => {
