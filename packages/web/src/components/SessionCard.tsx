@@ -39,8 +39,6 @@ function getStatusBadgeInfo(status: SessionStatus): {
     className: "h-3 w-3",
   };
 
-  const iconPropsSmall = { ...iconProps, className: "h-2.5 w-2.5" };
-
   switch (status) {
     case "spawning":
       return {
