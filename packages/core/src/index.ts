@@ -113,6 +113,13 @@ export {
   recordTerminalActivity,
 } from "./activity-log.js";
 
+// Activity ring buffer — in-memory SSE event store
+export {
+  activityLog,
+  createActivityRingBuffer,
+} from "./activity-ring-buffer.js";
+export type { ActivityEvent, ActivityRingBuffer } from "./activity-ring-buffer.js";
+
 // Agent workspace hooks — shared PATH-wrapper setup for non-Claude agents
 export {
   setupPathWrapperWorkspace,
