@@ -29,7 +29,7 @@
   "pnpm": {
     "overrides": {
       "axios": ">=1.15.2",
-      "next": ">=15.5.15"
+      "next": ">=15.5.15 <17"
     }
   },
   "devDependencies": {

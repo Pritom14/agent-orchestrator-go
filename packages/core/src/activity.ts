@@ -1,11 +1,11 @@
 import type { SessionStatus } from "./types.js";
 
 export type ActivityEvent =
-  | { type: "status_change"; sessionId: string; from: SessionStatus; to: SessionStatus; ts: number }
-  | { type: "message_sent"; sessionId: string; message: string; ts: number }
-  | { type: "tool_call"; sessionId: string; tool: string; args?: string; ts: number }
-  | { type: "ci_result"; sessionId: string; status: "pass" | "fail"; checkName: string; ts: number }
-  | { type: "review_comment"; sessionId: string; body: string; author: string; ts: number };
+  | { type: "status_change"; sessionId: string; from: SessionStatus; to: SessionStatus; /** epoch ms */ ts: number }
+  | { type: "message_sent"; sessionId: string; message: string; /** epoch ms */ ts: number }
+  | { type: "tool_call"; sessionId: string; tool: string; args?: string; /** epoch ms */ ts: number }
+  | { type: "ci_result"; sessionId: string; status: "pass" | "fail"; checkName: string; /** epoch ms */ ts: number }
+  | { type: "review_comment"; sessionId: string; body: string; author: string; /** epoch ms */ ts: number };
 
 export class ActivityLog {
   private readonly capacity: number;
