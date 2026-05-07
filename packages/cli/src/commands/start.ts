@@ -34,11 +34,11 @@ import {
   type OrchestratorConfig,
   type ProjectConfig,
   type ParsedRepoUrl,
-} from "@composio/ao-core";
+} from "@aoagents/ao-core";
 import { parse as yamlParse, stringify as yamlStringify } from "yaml";
 import { exec, execSilent, git } from "../lib/shell.js";
 import { getSessionManager } from "../lib/create-session-manager.js";
-import { ensureLifecycleWorker, stopLifecycleWorker } from "../lib/lifecycle-service.js";
+import { ensureLifecycleWorker, stopAllLifecycleWorkers } from "../lib/lifecycle-service.js";
 import {
   findWebDir,
   buildDashboardEnv,
@@ -51,6 +51,7 @@ import {
 import { rebuildDashboardProductionArtifacts } from "../lib/dashboard-rebuild.js";
 import { preflight } from "../lib/preflight.js";
 import { register, unregister, isAlreadyRunning, getRunning, waitForExit } from "../lib/running-state.js";
+import { preventIdleSleep } from "../lib/prevent-sleep.js";
 import { isHumanCaller } from "../lib/caller-context.js";
 import { detectEnvironment } from "../lib/detect-env.js";
 import { detectAgentRuntime, detectAvailableAgents, type DetectedAgent } from "../lib/detect-agent.js";
@@ -922,6 +923,16 @@ async function runStartup(
   }
   await warnAboutOpenClawStatus(config);
 
+  // Prevent macOS idle sleep while AO is running (if enabled in config)
+  // Uses caffeinate -i -w <pid> to hold an assertion tied to this process lifetime.
+  // No-op on non-macOS platforms.
+  if (config.power?.preventIdleSleep !== false) {
+    const sleepHandle = preventIdleSleep();
+    if (sleepHandle) {
+      console.log(chalk.dim("  Preventing macOS idle sleep while AO is running"));
+    }
+  }
+
   // Only inject OpenClaw credentials when the project actually uses OpenClaw.
   // This avoids exposing API keys to projects/plugins that don't need them.
   const openclawNotifier = config.notifiers?.["openclaw"];
@@ -993,8 +1004,8 @@ async function runStartup(
       lifecycleStatus = await ensureLifecycleWorker(config, projectId);
       spinner.succeed(
         lifecycleStatus.started
-          ? `Lifecycle worker started${lifecycleStatus.pid ? ` (PID ${lifecycleStatus.pid})` : ""}`
-          : `Lifecycle worker already running${lifecycleStatus.pid ? ` (PID ${lifecycleStatus.pid})` : ""}`,
+          ? "Lifecycle polling started"
+          : "Lifecycle polling already running",
       );
     } catch (err) {
       spinner.fail("Lifecycle worker failed to start");
@@ -1090,10 +1101,7 @@ async function runStartup(
 
   if (shouldStartLifecycle && lifecycleStatus) {
     const lifecycleLabel = lifecycleStatus.started ? "started" : "already running";
-    const lifecycleTarget = lifecycleStatus.pid
-      ? `${lifecycleLabel} (PID ${lifecycleStatus.pid})`
-      : lifecycleLabel;
-    console.log(chalk.cyan("Lifecycle:"), lifecycleTarget);
+    console.log(chalk.cyan("Lifecycle:"), lifecycleLabel);
   }
 
   if (hasExistingOrchestrators) {
@@ -1370,13 +1378,35 @@ export function registerStart(program: Command): void {
           const actualPort = await runStartup(config, projectId, project, opts);
 
           // ── Register in running.json (Step 11) ──
+          // Only record the project this invocation actually polls. Other
+          // configured projects are not covered by this lifecycle loop, and
+          // `ao spawn` relies on this list to decide whether to warn users.
           await register({
             pid: process.pid,
             configPath: config.configPath,
             port: actualPort,
             startedAt: new Date().toISOString(),
-            projects: Object.keys(config.projects),
+            projects: [projectId],
           });
+
+          // Install shutdown handlers so `ao stop` (which sends SIGTERM to
+          // this pid) flushes lifecycle health state before exit. Handlers
+          // MUST call process.exit() — installing a SIGINT/SIGTERM listener
+          // removes Node's default exit behavior, so without an explicit
+          // exit the interval timer would keep the event loop alive.
+          let shuttingDown = false;
+          const shutdown = (signal: NodeJS.Signals): void => {
+            if (shuttingDown) return;
+            shuttingDown = true;
+            try {
+              stopAllLifecycleWorkers();
+            } catch {
+              // Best-effort cleanup — never block shutdown on observability.
+            }
+            process.exit(signal === "SIGINT" ? 130 : 0);
+          };
+          process.once("SIGINT", shutdown);
+          process.once("SIGTERM", shutdown);
         } catch (err) {
           if (err instanceof Error) {
             console.error(chalk.red("\nError:"), err.message);
@@ -1451,12 +1481,11 @@ export function registerStop(program: Command): void {
             console.log(chalk.yellow(`Orchestrator session "${sessionId}" is not running`));
           }
 
-          const lifecycleStopped = await stopLifecycleWorker(config, _projectId);
-          if (lifecycleStopped) {
-            console.log(chalk.green("Lifecycle worker stopped"));
-          } else {
-            console.log(chalk.yellow("Lifecycle worker not running"));
-          }
+          // Lifecycle polling runs in-process inside the `ao start` process
+          // (registered via `running.json`). Sending SIGTERM to that PID below
+          // triggers the shared shutdown handler in `lifecycle-service`, which
+          // stops every per-project loop. No explicit stop call needed here —
+          // this CLI invocation is a separate process with an empty active map.
 
           // Stop dashboard — kill parent PID from running.json, then also stop
           // any dashboard child process via lsof (parent SIGTERM may not propagate)

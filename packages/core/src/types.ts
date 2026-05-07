@@ -232,10 +232,6 @@ export interface SessionSpawnConfig {
   agent?: string;
   /** Override the OpenCode subagent for this session (e.g. "sisyphus", "oracle") */
   subagent?: string;
-  /** Decomposition context — ancestor task chain (passed to prompt builder) */
-  lineage?: string[];
-  /** Decomposition context — sibling task descriptions (passed to prompt builder) */
-  siblings?: string[];
 }
 
 /** Config for creating an orchestrator session */
@@ -545,6 +541,7 @@ export interface Issue {
   labels: string[];
   assignee?: string;
   priority?: number;
+  branchName?: string;
 }
 
 export interface IssueFilters {
@@ -1003,6 +1000,19 @@ export interface ReactionResult {
 // CONFIGURATION
 // =============================================================================
 
+/**
+ * Power management configuration.
+ * Controls system sleep behavior while AO is running.
+ */
+export interface PowerConfig {
+  /**
+   * Prevent macOS idle sleep while AO is running.
+   * Uses `caffeinate -i -w <pid>` to hold an assertion.
+   * Defaults to true on macOS, no-op on other platforms.
+   */
+  preventIdleSleep: boolean;
+}
+
 /** Top-level orchestrator configuration (from agent-orchestrator.yaml) */
 export interface OrchestratorConfig {
   /**
@@ -1023,6 +1033,9 @@ export interface OrchestratorConfig {
 
   /** Milliseconds before a "ready" session becomes "idle" (default: 300000 = 5 min) */
   readyThresholdMs: number;
+
+  /** Power management settings (idle sleep prevention, etc.). Populated with defaults post-validation. */
+  power?: PowerConfig;
 
   /** Default plugin selections */
   defaults: DefaultPlugins;
@@ -1185,18 +1198,6 @@ export interface ProjectConfig {
     | "kill-previous";
 
   opencodeIssueSessionStrategy?: "reuse" | "delete" | "ignore";
-
-  /** Task decomposition configuration */
-  decomposer?: {
-    /** Enable auto-decomposition for backlog issues (default: false) */
-    enabled: boolean;
-    /** Max recursion depth (default: 3) */
-    maxDepth: number;
-    /** Model to use for decomposition (default: claude-sonnet-4-20250514) */
-    model: string;
-    /** Require human approval before executing decomposed plans (default: true) */
-    requireApproval: boolean;
-  };
 }
 
 export interface TrackerConfig {
@@ -1389,6 +1390,7 @@ export interface SessionMetadata {
   directTerminalWsPort?: number;
   opencodeSessionId?: string;
   pinnedSummary?: string; // First quality summary, pinned for display stability
+  userPrompt?: string; // Prompt used when spawning without a tracker issue
 }
 
 // =============================================================================

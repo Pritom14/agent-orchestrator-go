@@ -10,7 +10,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { parse as parseYaml } from "yaml";
-import type { SessionManager } from "@composio/ao-core";
+import type { SessionManager } from "@aoagents/ao-core";
 
 // ---------------------------------------------------------------------------
 // Hoisted mocks
@@ -24,7 +24,6 @@ const {
   mockWaitForPortAndOpen,
   mockSpawn,
   mockEnsureLifecycleWorker,
-  mockStopLifecycleWorker,
 } = vi.hoisted(() => ({
   mockExec: vi.fn(),
   mockExecSilent: vi.fn(),
@@ -42,7 +41,6 @@ const {
   mockWaitForPortAndOpen: vi.fn().mockResolvedValue(undefined),
   mockSpawn: vi.fn(),
   mockEnsureLifecycleWorker: vi.fn(),
-  mockStopLifecycleWorker: vi.fn(),
 }));
 
 const { mockDetectOpenClawInstallation } = vi.hoisted(() => ({
@@ -74,9 +72,9 @@ vi.mock("ora", () => ({
   }),
 }));
 
-vi.mock("@composio/ao-core", async (importOriginal) => {
+vi.mock("@aoagents/ao-core", async (importOriginal) => {
   // eslint-disable-next-line @typescript-eslint/consistent-type-imports
-  const actual = await importOriginal<typeof import("@composio/ao-core")>();
+  const actual = await importOriginal<typeof import("@aoagents/ao-core")>();
   const normalizeOrchestratorSessionStrategy =
     actual.normalizeOrchestratorSessionStrategy ??
     ((strategy: string | undefined) => {
@@ -101,7 +99,7 @@ vi.mock("../../src/lib/create-session-manager.js", () => ({
 
 vi.mock("../../src/lib/lifecycle-service.js", () => ({
   ensureLifecycleWorker: (...args: unknown[]) => mockEnsureLifecycleWorker(...args),
-  stopLifecycleWorker: (...args: unknown[]) => mockStopLifecycleWorker(...args),
+  stopAllLifecycleWorkers: vi.fn(),
 }));
 
 vi.mock("../../src/lib/web-dir.js", () => ({
@@ -238,12 +236,7 @@ beforeEach(() => {
   mockEnsureLifecycleWorker.mockResolvedValue({
     running: true,
     started: true,
-    pid: 12345,
-    pidFile: "/tmp/lifecycle-worker.pid",
-    logFile: "/tmp/lifecycle-worker.log",
   });
-  mockStopLifecycleWorker.mockReset();
-  mockStopLifecycleWorker.mockResolvedValue(true);
   mockDetectOpenClawInstallation.mockReset();
   mockDetectOpenClawInstallation.mockResolvedValue({
     state: "missing",
@@ -1039,10 +1032,6 @@ describe("stop command", () => {
     expect(mockSessionManager.kill).toHaveBeenCalledWith("app-orchestrator", {
       purgeOpenCode: false,
     });
-    expect(mockStopLifecycleWorker).toHaveBeenCalledWith(
-      expect.objectContaining({ configPath: expect.any(String) }),
-      "my-app",
-    );
     const output = vi
       .mocked(console.log)
       .mock.calls.map((c) => c.join(" "))
@@ -1058,10 +1047,6 @@ describe("stop command", () => {
     await program.parseAsync(["node", "test", "stop"]);
 
     expect(mockSessionManager.kill).not.toHaveBeenCalled();
-    expect(mockStopLifecycleWorker).toHaveBeenCalledWith(
-      expect.objectContaining({ configPath: expect.any(String) }),
-      "my-app",
-    );
     const output = vi
       .mocked(console.log)
       .mock.calls.map((c) => c.join(" "))

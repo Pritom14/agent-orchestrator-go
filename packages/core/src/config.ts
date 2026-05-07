@@ -163,20 +163,6 @@ const RoleAgentConfigSchema = z
   })
   .optional();
 
-const DecomposerConfigSchema = z
-  .object({
-    enabled: z.boolean().default(false),
-    maxDepth: z.number().min(1).max(5).default(3),
-    model: z.string().default("claude-sonnet-4-20250514"),
-    requireApproval: z.boolean().default(true),
-  })
-  .default({
-    enabled: false,
-    maxDepth: 3,
-    model: "claude-sonnet-4-20250514",
-    requireApproval: true,
-  });
-
 const ProjectConfigSchema = z.object({
   name: z.string().optional(),
   repo: z.string(),
@@ -204,7 +190,6 @@ const ProjectConfigSchema = z.object({
     .enum(["reuse", "delete", "ignore", "delete-new", "ignore-new", "kill-previous"])
     .optional(),
   opencodeIssueSessionStrategy: z.enum(["reuse", "delete", "ignore"]).optional(),
-  decomposer: DecomposerConfigSchema.optional(),
 });
 
 const DefaultPluginsSchema = z.object({
@@ -243,11 +228,23 @@ const InstalledPluginConfigSchema = z
     }
   });
 
+const PowerConfigSchema = z
+  .object({
+    /**
+     * Prevent macOS idle sleep while AO is running.
+     * Uses `caffeinate -i -w <pid>` to hold an assertion.
+     * Defaults to true on macOS, no-op on other platforms.
+     */
+    preventIdleSleep: z.boolean().default(process.platform === "darwin"),
+  })
+  .default({});
+
 const OrchestratorConfigSchema = z.object({
   port: z.number().default(3000),
   terminalPort: z.number().optional(),
   directTerminalPort: z.number().optional(),
   readyThresholdMs: z.number().nonnegative().default(300_000),
+  power: PowerConfigSchema,
   defaults: DefaultPluginsSchema.default({}),
   plugins: z.array(InstalledPluginConfigSchema).default([]),
   projects: z.record(
