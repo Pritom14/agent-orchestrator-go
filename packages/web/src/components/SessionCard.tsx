@@ -335,6 +335,7 @@ function SessionCardView({ session, onSend, onKill, onMerge, onRestore }: Sessio
               rel="noopener noreferrer"
               onClick={(e) => e.stopPropagation()}
               className="done-meta-chip font-[var(--font-mono)] font-bold text-[var(--color-text-primary)] no-underline underline-offset-2 hover:underline"
+              title={session.branch ?? undefined}
             >
               #{pr.number}
             </a>
@@ -578,6 +579,7 @@ function SessionCardView({ session, onSend, onKill, onMerge, onRestore }: Sessio
               rel="noopener noreferrer"
               onClick={(e) => e.stopPropagation()}
               className="card__pr"
+              title={session.branch ?? undefined}
             >
               #{pr.number}
             </a>
