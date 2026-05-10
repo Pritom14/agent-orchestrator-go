@@ -507,6 +507,7 @@ function SessionCardView({ session, onSend, onKill, onMerge, onRestore }: Sessio
             cardDotTone === "waiting" && "card__adot--waiting",
             cardDotTone === "exited" && "card__adot--exited",
           )}
+          title={cardDotTone}
         />
         <span className="card__id">{session.id}</span>
         <div className="flex-1" />
