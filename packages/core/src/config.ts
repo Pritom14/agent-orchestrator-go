@@ -906,6 +906,7 @@ export function findConfig(startDir?: string): string | null {
 
 /** Load and validate config from a YAML file */
 export function loadConfig(configPath?: string): LoadedConfig {
+  console.log(`[ao:config] loading config from: ${configPath ?? "auto-detect"}`);
   // Priority: 1. Explicit param, 2. Search (including AO_CONFIG_PATH env var)
   // findConfigFile treats AO_CONFIG_PATH as authoritative when present.
   const path = configPath ?? findConfigFile();
@@ -934,6 +935,9 @@ export function loadConfig(configPath?: string): LoadedConfig {
   if (!("degradedProjects" in config)) {
     (config as LoadedConfig).degradedProjects = {};
   }
+
+  const projectIds = Object.keys((config as LoadedConfig).projects ?? {});
+  console.log(`[ao:config] loaded ${projectIds.length} project(s): ${projectIds.join(", ") || "(none)"}`);
 
   return config as LoadedConfig;
 }
