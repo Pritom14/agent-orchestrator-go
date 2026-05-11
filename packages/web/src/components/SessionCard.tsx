@@ -3,6 +3,7 @@
 import { memo, useState, useEffect, useRef } from "react";
 import {
   type DashboardSession,
+  type AttentionLevel,
   getAttentionLevel,
   isPRRateLimited,
   isPRUnenriched,
@@ -26,6 +27,18 @@ import { projectSessionHashPath, projectSessionPath } from "@/lib/routes";
  * unmounts and remounts a card due to attention-level column changes.
  */
 const enteredSessionIds = new Set<string>();
+
+/** Tracks the last known attention level per session for slide-direction logic. */
+const sessionLevelMap = new Map<string, AttentionLevel>();
+
+const COLUMN_ORDER: AttentionLevel[] = [
+  "working",
+  "pending",
+  "review",
+  "respond",
+  "merge",
+  "done",
+];
 
 interface SessionCardProps {
   session: DashboardSession;
@@ -154,6 +167,24 @@ function SessionCardView({ session, onSend, onKill, onMerge, onRestore }: Sessio
   }, [hasEntered, session.id]);
 
   const level = getAttentionLevel(session);
+
+  // Compute slide direction once at mount: new sessions fade up, column
+  // transitions slide in from the direction they came from.
+  const [slideType] = useState<"spawn" | "forward" | "backward" | "none">(() => {
+    if (!enteredSessionIds.has(session.id)) return "spawn";
+    const prevLevel = sessionLevelMap.get(session.id);
+    if (!prevLevel || prevLevel === level) return "none";
+    const prevIdx = COLUMN_ORDER.indexOf(prevLevel);
+    const currIdx = COLUMN_ORDER.indexOf(level);
+    if (prevIdx === -1 || currIdx === -1) return "none";
+    return prevIdx < currIdx ? "forward" : "backward";
+  });
+
+  // Keep the level map current so the next column change can compute direction.
+  useEffect(() => {
+    sessionLevelMap.set(session.id, level);
+  }, [session.id, level]);
+
   const pr = session.pr;
 
   const handleQuickReply = async (message: string): Promise<boolean> => {
@@ -491,7 +522,9 @@ function SessionCardView({ session, onSend, onKill, onMerge, onRestore }: Sessio
     <div
       className={cn(
         "session-card border",
-        !hasEntered && "kanban-card-enter",
+        slideType === "spawn" && "kanban-card-enter",
+        slideType === "forward" && "kanban-card-slide-forward",
+        slideType === "backward" && "kanban-card-slide-backward",
         cardFrameClass,
         accentClass,
         isReadyToMerge && "card-merge-ready",

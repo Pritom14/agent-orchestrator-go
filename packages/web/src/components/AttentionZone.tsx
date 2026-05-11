@@ -1,6 +1,6 @@
 "use client";
 
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import {
   type DashboardSession,
   type AttentionLevel,
@@ -91,6 +91,19 @@ function AttentionZoneView({
   const config = zoneConfig[level];
   const isAccordion = onToggle !== undefined;
   const [showAll, setShowAll] = useState(false);
+
+  // Pulse the count badge when a new card arrives in this column.
+  const [countPulsing, setCountPulsing] = useState(false);
+  const prevCountRef = useRef(sessions.length);
+  useEffect(() => {
+    if (sessions.length > prevCountRef.current) {
+      setCountPulsing(true);
+      const t = setTimeout(() => setCountPulsing(false), 500);
+      prevCountRef.current = sessions.length;
+      return () => clearTimeout(t);
+    }
+    prevCountRef.current = sessions.length;
+  }, [sessions.length]);
   const visibleSessions =
     isAccordion && compactMobile && !showAll ? sessions.slice(0, 5) : sessions;
   const hiddenCount = sessions.length - visibleSessions.length;
@@ -172,7 +185,11 @@ function AttentionZoneView({
         <div className="kanban-column__title-row">
           <div className="kanban-column__dot" data-level={level} />
           <span className="kanban-column__title">{config.label}</span>
-          <span className="kanban-column__count">{sessions.length}</span>
+          <span
+            className={`kanban-column__count${countPulsing ? " kanban-column__count--pulse" : ""}`}
+          >
+            {sessions.length}
+          </span>
         </div>
       </div>
 
