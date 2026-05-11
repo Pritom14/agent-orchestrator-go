@@ -1075,6 +1075,59 @@ html.light .xterm .xterm-viewport:hover::-webkit-scrollbar-thumb:active {
   }
 }
 
+/* ── Kanban card directional slide transitions ────────────────────────── */
+
+.kanban-card-slide-forward {
+  animation: card-slide-forward 0.22s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.kanban-card-slide-backward {
+  animation: card-slide-backward 0.22s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes card-slide-forward {
+  from {
+    opacity: 0;
+    transform: translateX(-18px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes card-slide-backward {
+  from {
+    opacity: 0;
+    transform: translateX(18px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+/* ── Column count badge pulse on card arrival ─────────────────────────── */
+
+.kanban-column__count--pulse {
+  animation: column-badge-pulse 0.45s cubic-bezier(0.23, 1, 0.32, 1) both;
+}
+
+@keyframes column-badge-pulse {
+  0% {
+    transform: scale(1);
+  }
+  45% {
+    transform: scale(1.55);
+    background: color-mix(in srgb, var(--color-accent) 15%, var(--color-bg-subtle));
+    border-color: color-mix(in srgb, var(--color-accent) 30%, transparent);
+    color: var(--color-accent);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
 /* ── Orchestrator button ──────────────────────────────────────────────── */
 
 .orchestrator-btn {
