@@ -2,6 +2,7 @@
 
 import { memo, useState, useEffect, useRef } from "react";
 import {
+  type AttentionLevel,
   type DashboardSession,
   getAttentionLevel,
   isPRRateLimited,
@@ -21,14 +22,27 @@ import { getSizeLabel } from "./PRStatus";
 import { projectSessionHashPath, projectSessionPath } from "@/lib/routes";
 
 /**
- * Tracks which session IDs have already played their entrance animation.
- * Prevents the kanban-card-enter animation from replaying when React
- * unmounts and remounts a card due to attention-level column changes.
+ * Natural left-to-right column order used to determine slide direction on
+ * column transitions. When a session moves to a higher index column it slides
+ * in from the left; when moving to a lower index it slides in from the right.
  */
-const enteredSessionIds = new Set<string>();
+const COLUMN_ORDER: AttentionLevel[] = [
+  "working",
+  "pending",
+  "review",
+  "respond",
+  "action",
+  "merge",
+  "done",
+];
+
+/** Maps sessionId → the column (attention level) it was last seen in. */
+const sessionColumnMap = new Map<string, AttentionLevel>();
 
 interface SessionCardProps {
   session: DashboardSession;
+  /** The kanban column this card is rendered in. Used for directional animation. */
+  column?: AttentionLevel;
   onSend?: (sessionId: string, message: string) => Promise<void> | void;
   onKill?: (sessionId: string) => void;
   onMerge?: (prNumber: number) => void;
@@ -126,7 +140,7 @@ function getDoneStatusInfo(session: DashboardSession): {
   };
 }
 
-function SessionCardView({ session, onSend, onKill, onMerge, onRestore }: SessionCardProps) {
+function SessionCardView({ session, column, onSend, onKill, onMerge, onRestore }: SessionCardProps) {
   const [expanded, setExpanded] = useState(false);
   const [sendingAction, setSendingAction] = useState<string | null>(null);
   const [failedAction, setFailedAction] = useState<string | null>(null);
@@ -137,21 +151,31 @@ function SessionCardView({ session, onSend, onKill, onMerge, onRestore }: Sessio
   const actionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const quickReplyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Only play the entrance animation on the very first mount of this session.
-  // Subsequent remounts (e.g. attention-level column change) skip the animation
-  // to prevent the card from blinking (opacity 0→1 flash every SSE cycle).
-  const [hasEntered] = useState(() => enteredSessionIds.has(session.id));
+  // Determine entrance animation class at mount time:
+  //   - New session (no previous column): fade-up
+  //   - Column change (moved right): slide from left
+  //   - Column change (moved left): slide from right
+  //   - Same-column remount: no animation
+  const currentColumn = column ?? getAttentionLevel(session);
+  const [enterClass] = useState<string | null>(() => {
+    const prevColumn = sessionColumnMap.get(session.id);
+    if (prevColumn === undefined) return "kanban-card-enter";
+    if (prevColumn === currentColumn) return null;
+    const prevIdx = COLUMN_ORDER.indexOf(prevColumn);
+    const currIdx = COLUMN_ORDER.indexOf(currentColumn);
+    if (prevIdx === -1 || currIdx === -1) return "kanban-card-enter";
+    return currIdx > prevIdx ? "kanban-card-enter-from-left" : "kanban-card-enter-from-right";
+  });
+  // Delay map update via RAF so rapid unmount+remount before the frame
+  // fires still re-plays the entrance animation (matches old enteredSessionIds
+  // behaviour). Cleanup cancels the RAF so unmount before RAF = no map entry.
   useEffect(() => {
-    if (hasEntered) return;
-
+    if (enterClass === null) return;
     const frameId = window.requestAnimationFrame(() => {
-      enteredSessionIds.add(session.id);
+      sessionColumnMap.set(session.id, currentColumn);
     });
-
-    return () => {
-      window.cancelAnimationFrame(frameId);
-    };
-  }, [hasEntered, session.id]);
+    return () => window.cancelAnimationFrame(frameId);
+  }, [enterClass, session.id, currentColumn]);
 
   const level = getAttentionLevel(session);
   const pr = session.pr;
@@ -491,7 +515,7 @@ function SessionCardView({ session, onSend, onKill, onMerge, onRestore }: Sessio
     <div
       className={cn(
         "session-card border",
-        !hasEntered && "kanban-card-enter",
+        enterClass,
         cardFrameClass,
         accentClass,
         isReadyToMerge && "card-merge-ready",
