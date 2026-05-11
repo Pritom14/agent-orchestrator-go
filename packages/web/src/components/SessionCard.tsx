@@ -166,9 +166,16 @@ function SessionCardView({ session, column, onSend, onKill, onMerge, onRestore }
     if (prevIdx === -1 || currIdx === -1) return "kanban-card-enter";
     return currIdx > prevIdx ? "kanban-card-enter-from-left" : "kanban-card-enter-from-right";
   });
+  // Delay map update via RAF so rapid unmount+remount before the frame
+  // fires still re-plays the entrance animation (matches old enteredSessionIds
+  // behaviour). Cleanup cancels the RAF so unmount before RAF = no map entry.
   useEffect(() => {
-    sessionColumnMap.set(session.id, currentColumn);
-  }, [session.id, currentColumn]);
+    if (enterClass === null) return;
+    const frameId = window.requestAnimationFrame(() => {
+      sessionColumnMap.set(session.id, currentColumn);
+    });
+    return () => window.cancelAnimationFrame(frameId);
+  }, [enterClass, session.id, currentColumn]);
 
   const level = getAttentionLevel(session);
   const pr = session.pr;
