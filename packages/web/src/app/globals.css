@@ -5144,6 +5144,41 @@ html.light .xterm .xterm-viewport:hover::-webkit-scrollbar-thumb:active {
   color: var(--color-text-muted);
 }
 
+.kanban-column__activity-summary {
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--color-text-muted);
+  line-height: 1.4;
+}
+
+.kanban-column__activity-sep {
+  color: var(--color-text-tertiary);
+}
+
+.kanban-column__activity-summary [data-activity="active"] {
+  color: var(--color-status-working);
+}
+
+.kanban-column__activity-summary [data-activity="ready"] {
+  color: var(--color-status-ready);
+}
+
+.kanban-column__activity-summary [data-activity="idle"] {
+  color: var(--color-status-idle);
+}
+
+.kanban-column__activity-summary [data-activity="waiting_input"] {
+  color: var(--color-status-attention);
+}
+
+.kanban-column__activity-summary [data-activity="blocked"] {
+  color: var(--color-status-error);
+}
+
+.kanban-column__activity-summary [data-activity="exited"] {
+  color: var(--color-status-error);
+}
+
 .kanban-column__caption {
   display: none;
 }
