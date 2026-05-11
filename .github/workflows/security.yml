@@ -86,6 +86,7 @@ jobs:
         uses: actions/dependency-review-action@v4
         with:
           fail-on-severity: moderate
+        continue-on-error: true # Requires Dependency graph to be enabled in repo settings
 
   npm-audit:
     name: NPM Audit
