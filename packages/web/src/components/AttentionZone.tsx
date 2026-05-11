@@ -1,12 +1,13 @@
 "use client";
 
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import {
   type DashboardSession,
   type AttentionLevel,
   isPRMergeReady,
 } from "@/lib/types";
 import { SessionCard } from "./SessionCard";
+import { cn } from "@/lib/cn";
 import { getSessionTitle } from "@/lib/format";
 import { projectSessionPath } from "@/lib/routes";
 
@@ -94,6 +95,17 @@ function AttentionZoneView({
   const visibleSessions =
     isAccordion && compactMobile && !showAll ? sessions.slice(0, 5) : sessions;
   const hiddenCount = sessions.length - visibleSessions.length;
+  const [countPulsing, setCountPulsing] = useState(false);
+  const prevCountRef = useRef(sessions.length);
+  useEffect(() => {
+    if (sessions.length > prevCountRef.current) {
+      setCountPulsing(true);
+      const t = setTimeout(() => setCountPulsing(false), 450);
+      prevCountRef.current = sessions.length;
+      return () => clearTimeout(t);
+    }
+    prevCountRef.current = sessions.length;
+  }, [sessions.length]);
 
   useEffect(() => {
     if (collapsed) {
@@ -172,7 +184,9 @@ function AttentionZoneView({
         <div className="kanban-column__title-row">
           <div className="kanban-column__dot" data-level={level} />
           <span className="kanban-column__title">{config.label}</span>
-          <span className="kanban-column__count">{sessions.length}</span>
+          <span className={cn("kanban-column__count", countPulsing && "kanban-column__count--pulse")}>
+            {sessions.length}
+          </span>
         </div>
       </div>
 
@@ -183,6 +197,7 @@ function AttentionZoneView({
               <SessionCard
                 key={session.id}
                 session={session}
+                column={level}
                 onSend={onSend}
                 onKill={onKill}
                 onMerge={onMerge}

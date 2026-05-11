@@ -1075,6 +1075,58 @@ html.light .xterm .xterm-viewport:hover::-webkit-scrollbar-thumb:active {
   }
 }
 
+@keyframes card-enter-from-left {
+  from {
+    opacity: 0;
+    transform: translateX(-20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes card-enter-from-right {
+  from {
+    opacity: 0;
+    transform: translateX(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.kanban-card-enter-from-left {
+  animation: card-enter-from-left 0.22s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.kanban-card-enter-from-right {
+  animation: card-enter-from-right 0.22s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes count-badge-pulse {
+  0% {
+    transform: scale(1);
+    background: var(--color-bg-subtle);
+    color: var(--color-text-muted);
+  }
+  45% {
+    transform: scale(1.35);
+    background: var(--color-accent);
+    color: #fff;
+  }
+  100% {
+    transform: scale(1);
+    background: var(--color-bg-subtle);
+    color: var(--color-text-muted);
+  }
+}
+
+.kanban-column__count--pulse {
+  animation: count-badge-pulse 0.45s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
 /* ── Orchestrator button ──────────────────────────────────────────────── */
 
 .orchestrator-btn {
@@ -5362,8 +5414,7 @@ html.light .xterm .xterm-viewport:hover::-webkit-scrollbar-thumb:active {
   }
 
   .kanban-board {
-    height: auto;
-    min-height: calc(100vh - 240px);
+    height: calc(100dvh - 240px);
   }
 
   .session-card--fixed {
