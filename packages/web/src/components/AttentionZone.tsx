@@ -4,6 +4,7 @@ import { memo, useEffect, useState } from "react";
 import {
   type DashboardSession,
   type AttentionLevel,
+  type ActivityState,
   isPRMergeReady,
 } from "@/lib/types";
 import { SessionCard } from "./SessionCard";
@@ -174,6 +175,7 @@ function AttentionZoneView({
           <span className="kanban-column__title">{config.label}</span>
           <span className="kanban-column__count">{sessions.length}</span>
         </div>
+        {sessions.length > 0 ? <ActivitySummaryLine sessions={sessions} /> : null}
       </div>
 
       <div className="kanban-column-body">
@@ -192,6 +194,49 @@ function AttentionZoneView({
           </div>
         ) : null}
       </div>
+    </div>
+  );
+}
+
+const ACTIVITY_DISPLAY_ORDER: ActivityState[] = [
+  "blocked",
+  "waiting_input",
+  "exited",
+  "active",
+  "ready",
+  "idle",
+];
+
+const ACTIVITY_LABELS: Record<ActivityState, string> = {
+  blocked: "blocked",
+  waiting_input: "waiting",
+  exited: "crashed",
+  active: "active",
+  ready: "ready",
+  idle: "idle",
+};
+
+function ActivitySummaryLine({ sessions }: { sessions: DashboardSession[] }) {
+  const counts = new Map<ActivityState, number>();
+  for (const session of sessions) {
+    if (session.activity) {
+      counts.set(session.activity, (counts.get(session.activity) ?? 0) + 1);
+    }
+  }
+
+  const parts = ACTIVITY_DISPLAY_ORDER.filter((state) => (counts.get(state) ?? 0) > 0);
+  if (parts.length === 0) return null;
+
+  return (
+    <div className="kanban-column__activity-summary">
+      {parts.map((state, i) => (
+        <span key={state}>
+          {i > 0 ? <span className="kanban-column__activity-sep"> · </span> : null}
+          <span data-activity={state}>
+            {counts.get(state)} {ACTIVITY_LABELS[state]}
+          </span>
+        </span>
+      ))}
     </div>
   );
 }
