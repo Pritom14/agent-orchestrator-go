@@ -388,7 +388,10 @@ function ProjectSidebarInner({
   const sessionsKey = useMemo(
     () =>
       (sessions ?? [])
-        .map((s) => `${s.id}:${s.status}:${s.activity ?? ""}:${s.projectId}`)
+        .map(
+          (s) =>
+            `${s.id}:${s.status}:${s.activity ?? ""}:${s.projectId}:${s.displayName ?? ""}:${s.displayNameUserSet ? "1" : "0"}:${s.branch ?? ""}`,
+        )
         .join("|"),
     [sessions],
   );
