@@ -40,7 +40,6 @@ import pluginRuntimeProcess from "@aoagents/ao-plugin-runtime-process";
 import pluginAgentClaudeCode from "@aoagents/ao-plugin-agent-claude-code";
 import pluginAgentCodex from "@aoagents/ao-plugin-agent-codex";
 import pluginAgentCursor from "@aoagents/ao-plugin-agent-cursor";
-import pluginAgentKimicode from "@aoagents/ao-plugin-agent-kimicode";
 import pluginAgentOpencode from "@aoagents/ao-plugin-agent-opencode";
 import pluginWorkspaceWorktree from "@aoagents/ao-plugin-workspace-worktree";
 import pluginScmGithub from "@aoagents/ao-plugin-scm-github";
@@ -112,7 +111,6 @@ async function initServices(): Promise<Services> {
   registry.register(pluginAgentClaudeCode);
   registry.register(pluginAgentCodex);
   registry.register(pluginAgentCursor);
-  registry.register(pluginAgentKimicode);
   registry.register(pluginAgentOpencode);
   registry.register(pluginWorkspaceWorktree);
   registry.register(pluginScmGithub);
@@ -360,7 +358,7 @@ export async function pollBacklog(): Promise<void> {
           if (isGoalCard && issue.labels.includes("agent:backlog")) {
             // Spawn an ORCHESTRATOR session for goal cards
             const systemPrompt = await generateOrchestratorSystemPrompt(config, registry, projectId, project, issue.id);
-            await sessionManager.spawnOrchestrator({ projectId, issueId: issue.id, systemPrompt });
+            await sessionManager.spawnOrchestrator({ projectId, systemPrompt });
             availableSlots--;
 
             activeIssueIds.add(issue.id.toLowerCase());

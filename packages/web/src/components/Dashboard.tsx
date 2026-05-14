@@ -324,10 +324,8 @@ function DashboardInner({
       const currentLevel = getAttentionLevel(session, attentionZones);
       const prevLevel = prev[session.id];
       if (prevLevel !== undefined && prevLevel !== currentLevel) {
-        const prevIdx = kanbanLevels.indexOf(prevLevel as (typeof kanbanLevels)[number]);
-        const curIdx = kanbanLevels.indexOf(currentLevel as (typeof kanbanLevels)[number]);
-        // Card moved right in board → enters from left; moved left → enters from right
-        moved.set(session.id, prevIdx < curIdx ? "left" : "right");
+        const direction = getMoveDirection(prevLevel as AttentionLevel, currentLevel, kanbanLevels);
+        if (direction) moved.set(session.id, direction);
       }
     }
     return moved;
