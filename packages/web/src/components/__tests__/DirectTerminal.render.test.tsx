@@ -4,6 +4,9 @@ import { DirectTerminal } from "../DirectTerminal";
 
 const replaceMock = vi.fn();
 let searchParams = new URLSearchParams();
+const { useFullscreenResizeMock } = vi.hoisted(() => ({
+  useFullscreenResizeMock: vi.fn(),
+}));
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ replace: replaceMock }),
@@ -13,6 +16,10 @@ vi.mock("next/navigation", () => ({
 
 vi.mock("next-themes", () => ({
   useTheme: () => ({ resolvedTheme: "dark" }),
+}));
+
+vi.mock("../terminal/useFullscreenResize", () => ({
+  useFullscreenResize: useFullscreenResizeMock,
 }));
 
 class MockTerminal {
@@ -76,7 +83,7 @@ class MockWebSocket {
   close() {}
 }
 
-vi.mock("xterm", () => ({
+vi.mock("@xterm/xterm", () => ({
   Terminal: MockTerminal,
 }));
 
@@ -105,10 +112,18 @@ describe("DirectTerminal render", () => {
   beforeEach(() => {
     searchParams = new URLSearchParams();
     replaceMock.mockReset();
+    useFullscreenResizeMock.mockReset();
     MockWebSocket.instances = [];
     Object.defineProperty(document, "fonts", {
       configurable: true,
-      value: { ready: Promise.resolve() },
+      value: {
+        ready: Promise.resolve(),
+        // FontFaceSet is an EventTarget in real browsers; the component
+        // listens for 'loadingdone' to re-fit after webfont swap. Stub the
+        // methods so init doesn't throw.
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      },
     });
     vi.stubGlobal("WebSocket", MockWebSocket);
     vi.stubGlobal(
@@ -128,11 +143,15 @@ describe("DirectTerminal render", () => {
   });
 
   it("renders the shared accent chrome for orchestrator terminals", async () => {
-    render(<DirectTerminal sessionId="ao-orchestrator" variant="orchestrator" />);
-
-    await waitFor(() =>
-      expect(screen.getByText("Connected")).toBeInTheDocument(),
+    render(
+      <DirectTerminal
+        sessionId="ao-orchestrator"
+        tmuxName="ao-orchestrator"
+        variant="orchestrator"
+      />,
     );
+
+    await waitFor(() => expect(screen.getByText("Connected")).toBeInTheDocument());
 
     expect(screen.getByText("ao-orchestrator")).toHaveStyle({ color: "var(--color-accent)" });
     expect(screen.getByText("XDA")).toHaveStyle({ color: "var(--color-accent)" });
@@ -142,6 +161,7 @@ describe("DirectTerminal render", () => {
     render(
       <DirectTerminal
         sessionId="ao-opencode"
+        tmuxName="ao-opencode"
         chromeless
         isOpenCodeSession
       />,
@@ -156,7 +176,13 @@ describe("DirectTerminal render", () => {
   });
 
   it("switches the terminal shell between inline and fullscreen positioning", async () => {
-    const { container } = render(<DirectTerminal sessionId="ao-orchestrator" variant="orchestrator" />);
+    const { container } = render(
+      <DirectTerminal
+        sessionId="ao-orchestrator"
+        tmuxName="ao-orchestrator"
+        variant="orchestrator"
+      />,
+    );
 
     await waitFor(() =>
       expect(screen.getByRole("button", { name: "fullscreen" })).toBeInTheDocument(),
@@ -178,5 +204,18 @@ describe("DirectTerminal render", () => {
     expect(screen.getByRole("button", { name: "fullscreen" })).toBeInTheDocument();
     expect(terminalShell).toHaveClass("relative");
     expect(terminalShell).not.toHaveClass("fixed");
+  });
+
+  it("passes projectId to fullscreen resize hook for scoped mux resize", () => {
+    render(<DirectTerminal sessionId="app-1" projectId="project-a" tmuxName="project-a-app-1" />);
+
+    expect(useFullscreenResizeMock).toHaveBeenCalledWith(
+      false,
+      "app-1",
+      "project-a",
+      expect.any(Object),
+      expect.any(Object),
+      expect.any(Object),
+    );
   });
 });

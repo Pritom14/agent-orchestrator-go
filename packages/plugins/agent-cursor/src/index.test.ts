@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import type { Session, RuntimeHandle, AgentLaunchConfig } from "@aoagents/ao-core";
+import { createActivitySignal, type Session, type RuntimeHandle, type AgentLaunchConfig } from "@aoagents/ao-core";
 
 // Mock fs/promises for getSessionInfo tests
 vi.mock("node:fs/promises", async (importOriginal) => {
@@ -73,6 +73,11 @@ function makeSession(overrides: Partial<Session> = {}): Session {
     projectId: "test-project",
     status: "working",
     activity: "active",
+    activitySignal: createActivitySignal("valid", {
+      activity: "active",
+      timestamp: new Date(),
+      source: "native",
+    }),
     branch: "feat/test",
     issueId: null,
     pr: null,
@@ -199,9 +204,11 @@ describe("getLaunchCommand", () => {
     expect(cmd).toBe("agent --force --sandbox disabled --approve-mcps --model 'sonnet' -- 'Go'");
   });
 
-  it("escapes single quotes in prompt (POSIX shell escaping)", () => {
+  it("escapes single quotes in prompt", () => {
     const cmd = agent.getLaunchCommand(makeLaunchConfig({ prompt: "it's broken" }));
-    expect(cmd).toContain("'it'\\''s broken'");
+    // shellEscape picks POSIX ('\'') on Unix, PowerShell ('') on Windows.
+    const expected = process.platform === "win32" ? "'it''s broken'" : "'it'\\''s broken'";
+    expect(cmd).toContain(expected);
   });
 
   it("omits optional flags when not provided", () => {
@@ -503,14 +510,14 @@ describe("postLaunchSetup", () => {
 describe("getEnvironment PATH", () => {
   const agent = create();
 
-  it("prepends ~/.ao/bin to PATH", () => {
+  it("does not set PATH (injected by session-manager)", () => {
     const env = agent.getEnvironment(makeLaunchConfig());
-    expect(env["PATH"]).toMatch(/\.ao\/bin/);
+    expect(env["PATH"]).toBeUndefined();
   });
 
-  it("sets GH_PATH", () => {
+  it("does not set GH_PATH (injected by session-manager)", () => {
     const env = agent.getEnvironment(makeLaunchConfig());
-    expect(env["GH_PATH"]).toBe("/usr/local/bin/gh");
+    expect(env["GH_PATH"]).toBeUndefined();
   });
 });
 
@@ -613,7 +620,14 @@ describe("detect()", () => {
   it("returns true when agent --help contains 'Cursor Agent'", () => {
     mockExecFileSync.mockReturnValueOnce("Usage: agent [options]\n\nStart the Cursor Agent\n");
     expect(detect()).toBe(true);
-    expect(mockExecFileSync).toHaveBeenCalledWith("agent", ["--help"], { encoding: "utf-8" });
+    expect(mockExecFileSync).toHaveBeenCalledWith(
+      "agent",
+      ["--help"],
+      expect.objectContaining({
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }),
+    );
   });
 
   it("returns true when agent --help contains Cursor-specific flags (fallback)", () => {

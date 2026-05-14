@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync } from "node:
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { toClaudeProjectPath, create } from "../index.js";
-import type { Session, RuntimeHandle } from "@aoagents/ao-core";
+import { createActivitySignal, type Session, type RuntimeHandle } from "@aoagents/ao-core";
 
 // Mock homedir() so getActivityState looks in our temp dir
 vi.mock("node:os", async (importOriginal) => {
@@ -25,13 +25,18 @@ function makeSession(overrides: Partial<Session> = {}): Session {
     projectId: "test",
     status: "working",
     activity: "idle",
+    activitySignal: createActivitySignal("valid", {
+      activity: "idle",
+      timestamp: new Date(),
+      source: "native",
+    }),
     branch: "main",
     issueId: null,
     pr: null,
     workspacePath,
     runtimeHandle: handle,
     agentInfo: null,
-    createdAt: new Date(),
+    createdAt: new Date(Date.now() - 24 * 60 * 60 * 1000), // 1 day ago (well before any JSONL entries)
     lastActivityAt: new Date(),
     metadata: {},
     ...overrides,
@@ -71,7 +76,7 @@ describe("Claude Code Activity Detection", () => {
     });
 
     it("handles Windows paths (no leading slash)", () => {
-      expect(toClaudeProjectPath("C:\\Users\\dev\\project")).toBe("C-Users-dev-project");
+      expect(toClaudeProjectPath("C:\\Users\\dev\\project")).toBe("C--Users-dev-project");
     });
 
     it("handles consecutive dots and slashes", () => {

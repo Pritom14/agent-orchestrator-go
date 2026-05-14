@@ -1,13 +1,12 @@
 import {
   shellEscape,
+  isWindows,
   normalizeAgentPermissionMode,
-  buildAgentPath,
-  setupPathWrapperWorkspace,
   readLastActivityEntry,
   checkActivityLogState,
   getActivityFallbackState,
   recordTerminalActivity,
-  PREFERRED_GH_PATH,
+  hasRecentCommits,
   DEFAULT_READY_THRESHOLD_MS,
   DEFAULT_ACTIVE_WINDOW_MS,
   type Agent,
@@ -32,22 +31,6 @@ const execFileAsync = promisify(execFile);
 // =============================================================================
 // Cursor Activity Detection Helpers
 // =============================================================================
-
-/**
- * Check if Cursor has made recent commits (within last 60 seconds).
- */
-async function hasRecentCommits(workspacePath: string): Promise<boolean> {
-  try {
-    const { stdout } = await execFileAsync(
-      "git",
-      ["log", "--since=60 seconds ago", "--format=%H"],
-      { cwd: workspacePath, timeout: 5_000 },
-    );
-    return stdout.trim().length > 0;
-  } catch {
-    return false;
-  }
-}
 
 /**
  * Get modification time of Cursor session file if it exists.
@@ -229,9 +212,7 @@ function createCursorAgent(): Agent {
         env["AO_ISSUE_ID"] = config.issueId;
       }
 
-      // Prepend ~/.ao/bin to PATH so our gh/git wrappers intercept commands.
-      env["PATH"] = buildAgentPath(process.env["PATH"]);
-      env["GH_PATH"] = PREFERRED_GH_PATH;
+      // PATH and GH_PATH are injected by session-manager for all agents.
 
       return env;
     },
@@ -394,13 +375,12 @@ function createCursorAgent(): Agent {
       return null;
     },
 
-    async setupWorkspaceHooks(workspacePath: string, _config: WorkspaceHooksConfig): Promise<void> {
-      await setupPathWrapperWorkspace(workspacePath);
+    async setupWorkspaceHooks(_workspacePath: string, _config: WorkspaceHooksConfig): Promise<void> {
+      // PATH wrappers are installed by session-manager for all agents.
     },
 
-    async postLaunchSetup(session: Session): Promise<void> {
-      if (!session.workspacePath) return;
-      await setupPathWrapperWorkspace(session.workspacePath);
+    async postLaunchSetup(_session: Session): Promise<void> {
+      // PATH wrappers are re-ensured by session-manager.
     },
   };
 }
@@ -419,7 +399,13 @@ export function detect(): boolean {
     // with other binaries named "agent" (SSH agents, monitoring agents, etc.)
     // Note: --version only outputs a date/hash (e.g., "2026.04.08-a41fba1") with no
     // "cursor" marker, so we check --help output instead.
-    const helpOutput = execFileSync("agent", ["--help"], { encoding: "utf-8" });
+    const helpOutput = execFileSync("agent", ["--help"], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+      shell: isWindows(),
+      windowsHide: true,
+      timeout: 5_000,
+    });
     // Use multiple indicators for robustness - if Cursor changes one, others still work
     const hasCursorAgent = helpOutput.includes("Cursor Agent");
     const hasCursorFlags =

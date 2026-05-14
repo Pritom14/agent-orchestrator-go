@@ -4,13 +4,11 @@ import {
   shellEscape,
   readLastJsonlEntry,
   normalizeAgentPermissionMode,
-  buildAgentPath,
-  setupPathWrapperWorkspace,
   readLastActivityEntry,
   checkActivityLogState,
   getActivityFallbackState,
   recordTerminalActivity,
-  PREFERRED_GH_PATH,
+  isWindows,
   type Agent,
   type AgentSessionInfo,
   type AgentLaunchConfig,
@@ -28,6 +26,7 @@ import { createReadStream } from "node:fs";
 import { readdir, stat, lstat, open } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { createInterface } from "node:readline";
 import { promisify } from "node:util";
 
@@ -55,25 +54,47 @@ export const manifest = {
 
 /** Codex session directory: ~/.codex/sessions/ */
 const CODEX_SESSIONS_DIR = join(homedir(), ".codex", "sessions");
+const SESSION_MATCH_SCAN_CHUNK_BYTES = 8192;
+const SESSION_MATCH_SCAN_LINE_LIMIT = 10;
 
-/** Typed representation of a line in a Codex JSONL session file */
-interface CodexJsonlLine {
-  type?: string;
+interface CodexTokenUsage {
+  input_tokens?: number;
+  output_tokens?: number;
+  cached_input_tokens?: number;
+  cached_tokens?: number;
+  reasoning_output_tokens?: number;
+  reasoning_tokens?: number;
+}
+
+interface CodexJsonlPayload extends CodexTokenUsage {
+  id?: string;
   cwd?: string;
+  model_provider?: string;
   model?: string;
-  // Thread ID from thread_started notifications
+  turn_id?: string;
   threadId?: string;
-  // User message content (from user input events)
   content?: string;
   role?: string;
-  // event_msg with token_count subtype
-  msg?: {
-    type?: string;
-    input_tokens?: number;
-    output_tokens?: number;
-    cached_tokens?: number;
-    reasoning_tokens?: number;
+  type?: string;
+  info?: {
+    total_token_usage?: CodexTokenUsage;
+    last_token_usage?: CodexTokenUsage;
   };
+}
+
+/**
+ * Recent Codex versions wrap event fields in `payload`, while older fixtures
+ * used a flat shape. Accept both so session discovery works against real
+ * Codex JSONL and existing tests remain valid.
+ */
+interface CodexJsonlLine extends CodexJsonlPayload {
+  type?: string;
+  payload?: CodexJsonlPayload;
+  msg?: CodexTokenUsage & { type?: string };
+}
+
+function getCodexPayload(entry: CodexJsonlLine): CodexJsonlPayload {
+  return entry.payload ?? entry;
 }
 
 /**
@@ -119,41 +140,77 @@ async function collectJsonlFiles(dir: string, depth = 0): Promise<string[]> {
   return results;
 }
 
-/**
- * Check if the first few lines of a JSONL file contain a session_meta
- * entry matching the given workspace path. Reads only the first 4 KB
- * to avoid loading large rollout files into memory.
- */
-async function sessionFileMatchesCwd(
-  filePath: string,
-  workspacePath: string,
-): Promise<boolean> {
+async function readJsonlPrefixLines(filePath: string, maxLines: number): Promise<string[]> {
+  const handle = await open(filePath, "r");
+  const lines: string[] = [];
+  let partialLine = "";
+  // Reuse a single decoder across reads so multi-byte UTF-8 sequences that
+  // straddle a chunk boundary (e.g. CJK characters in base_instructions) get
+  // buffered correctly instead of producing U+FFFD replacement characters.
+  const decoder = new StringDecoder("utf8");
+
   try {
-    // Read only the first 4 KB — session_meta is always in the first few lines.
-    // Avoids loading large rollout files (100 MB+) into memory.
-    const handle = await open(filePath, "r");
-    let content: string;
-    try {
-      const buffer = Buffer.allocUnsafe(4096);
-      const { bytesRead } = await handle.read(buffer, 0, 4096, 0);
-      content = buffer.subarray(0, bytesRead).toString("utf-8");
-    } finally {
-      await handle.close();
+    while (lines.length < maxLines) {
+      const buffer = Buffer.allocUnsafe(SESSION_MATCH_SCAN_CHUNK_BYTES);
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+
+      if (bytesRead === 0) {
+        partialLine += decoder.end();
+        const finalLine = partialLine.trim();
+        if (finalLine) lines.push(finalLine);
+        break;
+      }
+
+      partialLine += decoder.write(buffer.subarray(0, bytesRead));
+
+      let newlineIndex = partialLine.indexOf("\n");
+      while (newlineIndex !== -1 && lines.length < maxLines) {
+        const line = partialLine.slice(0, newlineIndex).trim();
+        if (line) lines.push(line);
+        partialLine = partialLine.slice(newlineIndex + 1);
+        newlineIndex = partialLine.indexOf("\n");
+      }
     }
-    const lines = content.split("\n").slice(0, 10);
+  } finally {
+    await handle.close();
+  }
+
+  return lines;
+}
+
+/**
+ * Normalize a path for cross-platform comparison. Codex's JSONL may emit
+ * forward-slash paths or vary drive-letter case on Windows; AO constructs
+ * workspace paths via path.join which yields backslashes on Windows. Compare
+ * via a canonical form: forward slashes throughout, lowercased drive letter.
+ */
+function toComparablePath(p: string): string {
+  const slash = p.replace(/\\/g, "/");
+  return slash.replace(/^([a-zA-Z]):/, (_, d: string) => d.toLowerCase() + ":");
+}
+
+/**
+ * Check if the first few complete JSONL records of a session file contain a
+ * session_meta entry matching the given workspace path. This avoids parsing a
+ * truncated session_meta line when Codex embeds large base_instructions.
+ */
+async function sessionFileMatchesCwd(filePath: string, workspacePath: string): Promise<boolean> {
+  const wantedCwd = toComparablePath(workspacePath);
+  try {
+    const lines = await readJsonlPrefixLines(filePath, SESSION_MATCH_SCAN_LINE_LIMIT);
     for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
       try {
-        const parsed: unknown = JSON.parse(trimmed);
-        if (
-          typeof parsed === "object" &&
-          parsed !== null &&
-          !Array.isArray(parsed) &&
-          (parsed as CodexJsonlLine).type === "session_meta" &&
-          (parsed as CodexJsonlLine).cwd === workspacePath
-        ) {
-          return true;
+        const parsed: unknown = JSON.parse(line);
+        if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+          const entry = parsed as CodexJsonlLine;
+          const payload = getCodexPayload(entry);
+          if (
+            entry.type === "session_meta" &&
+            typeof payload.cwd === "string" &&
+            toComparablePath(payload.cwd) === wantedCwd
+          ) {
+            return true;
+          }
         }
       } catch {
         // Skip malformed lines
@@ -199,6 +256,8 @@ interface CodexSessionData {
   threadId: string | null;
   inputTokens: number;
   outputTokens: number;
+  cachedTokens: number;
+  reasoningTokens: number;
 }
 
 /**
@@ -208,7 +267,14 @@ interface CodexSessionData {
  */
 async function streamCodexSessionData(filePath: string): Promise<CodexSessionData | null> {
   try {
-    const data: CodexSessionData = { model: null, threadId: null, inputTokens: 0, outputTokens: 0 };
+    const data: CodexSessionData = {
+      model: null,
+      threadId: null,
+      inputTokens: 0,
+      outputTokens: 0,
+      cachedTokens: 0,
+      reasoningTokens: 0,
+    };
     const rl = createInterface({
       input: createReadStream(filePath, { encoding: "utf-8" }),
       crlfDelay: Infinity,
@@ -222,15 +288,59 @@ async function streamCodexSessionData(filePath: string): Promise<CodexSessionDat
         if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) continue;
         const entry = parsed as CodexJsonlLine;
 
-        if (entry.type === "session_meta" && typeof entry.model === "string") {
-          data.model = entry.model;
+        const payload = getCodexPayload(entry);
+
+        if (entry.type === "session_meta") {
+          if (typeof payload.id === "string" && payload.id) {
+            data.threadId = payload.id;
+          } else if (typeof payload.threadId === "string" && payload.threadId) {
+            data.threadId = payload.threadId;
+          }
         }
-        if (typeof entry.threadId === "string" && entry.threadId) {
-          data.threadId = entry.threadId;
+
+        if (!data.threadId) {
+          if (typeof payload.threadId === "string" && payload.threadId) {
+            data.threadId = payload.threadId;
+          } else if (typeof entry.threadId === "string" && entry.threadId) {
+            data.threadId = entry.threadId;
+          }
         }
+
+        if (entry.type === "turn_context" && typeof payload.model === "string" && payload.model) {
+          data.model = payload.model;
+        } else if (!data.model && typeof payload.model === "string" && payload.model) {
+          data.model = payload.model;
+        }
+
+        // Token sources are precedence-ordered: total → last → flat → legacy.
+        // `continue` ensures only one source is counted per entry.
+        // `total_token_usage` is a cumulative snapshot (last-write-wins, so `=`);
+        // the rest are per-turn deltas (accumulate with `+=`). Do not "fix" this.
+        const totalUsage = payload.info?.total_token_usage;
+        if (typeof totalUsage?.input_tokens === "number") {
+          data.inputTokens = totalUsage.input_tokens;
+          data.outputTokens = totalUsage.output_tokens ?? 0;
+          continue;
+        }
+
+        const lastUsage = payload.info?.last_token_usage;
+        if (typeof lastUsage?.input_tokens === "number") {
+          data.inputTokens += lastUsage.input_tokens;
+          data.outputTokens += lastUsage.output_tokens ?? 0;
+          continue;
+        }
+
+        if (typeof payload.input_tokens === "number") {
+          data.inputTokens += payload.input_tokens;
+          data.outputTokens += payload.output_tokens ?? 0;
+          continue;
+        }
+
         if (entry.type === "event_msg" && entry.msg?.type === "token_count") {
           data.inputTokens += entry.msg.input_tokens ?? 0;
           data.outputTokens += entry.msg.output_tokens ?? 0;
+          data.cachedTokens += entry.msg.cached_tokens ?? 0;
+          data.reasoningTokens += entry.msg.reasoning_tokens ?? 0;
         }
       } catch {
         // Skip malformed lines
@@ -253,6 +363,10 @@ async function streamCodexSessionData(filePath: string): Promise<CodexSessionDat
  * Returns "codex" as final fallback (let the shell resolve it at runtime).
  */
 export async function resolveCodexBinary(): Promise<string> {
+  if (isWindows()) {
+    return resolveCodexBinaryWindows();
+  }
+
   // 1. Try `which codex`
   try {
     const { stdout } = await execFileAsync("which", ["codex"], { timeout: 10_000 });
@@ -284,15 +398,68 @@ export async function resolveCodexBinary(): Promise<string> {
   return "codex";
 }
 
+/**
+ * Windows-specific binary lookup. `which` does not exist on Windows; the
+ * equivalent is `where.exe`, which can return multiple lines (PATHEXT
+ * variants). npm-installed CLIs land as `<name>.cmd` shims, while
+ * Rust/Cargo installs produce `<name>.exe`. We prefer the .cmd shim because
+ * it forwards to the right node binary, then fall back to .exe.
+ */
+async function resolveCodexBinaryWindows(): Promise<string> {
+  for (const target of ["codex.cmd", "codex.exe"]) {
+    try {
+      const { stdout } = await execFileAsync("where.exe", [target], {
+        timeout: 10_000,
+        windowsHide: true,
+      });
+      const first = stdout.split(/\r?\n/).find((line) => line.trim().length > 0);
+      if (first) return first.trim();
+    } catch {
+      // Not on PATH — try next target
+    }
+  }
+
+  // Fall back to common npm/Cargo install locations so AO works even when
+  // the user installed Codex into a directory not currently on PATH.
+  const appData = process.env["APPDATA"];
+  const home = homedir();
+  const candidates = [
+    appData ? join(appData, "npm", "codex.cmd") : null,
+    appData ? join(appData, "npm", "codex.exe") : null,
+    join(home, ".cargo", "bin", "codex.exe"),
+  ].filter((p): p is string => p !== null);
+
+  for (const candidate of candidates) {
+    try {
+      await stat(candidate);
+      return candidate;
+    } catch {
+      // Not at this location
+    }
+  }
+
+  // Last resort: bare name. PowerShell will hit PATHEXT to find codex.cmd.
+  // Combined with the `& ` prefix from formatLaunchCommand this still works.
+  return "codex";
+}
+
 // =============================================================================
 // Agent Implementation
 // =============================================================================
 
 /** Append approval-policy flags to a command parts array */
-function appendApprovalFlags(parts: string[], permissions: string | undefined): void {
+function appendApprovalFlags(
+  parts: string[],
+  permissions: string | undefined,
+  allowDangerousBypass = true,
+): void {
   const mode = normalizeAgentPermissionMode(permissions);
   if (mode === "permissionless") {
-    parts.push("--dangerously-bypass-approvals-and-sandbox");
+    if (allowDangerousBypass) {
+      parts.push("--dangerously-bypass-approvals-and-sandbox");
+    } else {
+      parts.push("--ask-for-approval", "never");
+    }
   } else if (mode === "auto-edit") {
     parts.push("--ask-for-approval", "never");
   } else if (mode === "suggest") {
@@ -333,8 +500,24 @@ async function findCodexSessionFileCached(workspacePath: string): Promise<string
     return cached.path;
   }
   const result = await findCodexSessionFile(workspacePath);
-  sessionFileCache.set(workspacePath, { path: result, expiry: Date.now() + SESSION_FILE_CACHE_TTL_MS });
+  sessionFileCache.set(workspacePath, {
+    path: result,
+    expiry: Date.now() + SESSION_FILE_CACHE_TTL_MS,
+  });
   return result;
+}
+
+/**
+ * Format a launch command for the host shell. On Windows the resolved binary
+ * path is single-quoted by shellEscape (e.g. `'C:\Users\...\codex.cmd'`), and
+ * PowerShell parses a leading quoted string as an expression — `'codex' -c …`
+ * fails with "Unexpected token '-c' in expression or statement". Prepending
+ * the call operator `& ` tells PowerShell to *invoke* the string as a command.
+ * On Unix the prefix is unnecessary; bash treats `'codex' -c …` as a command.
+ */
+function formatLaunchCommand(parts: string[]): string {
+  const cmd = parts.join(" ");
+  return isWindows() ? `& ${cmd}` : cmd;
 }
 
 function createCodexAgent(): Agent {
@@ -369,7 +552,7 @@ function createCodexAgent(): Agent {
         parts.push("--", shellEscape(config.prompt));
       }
 
-      return parts.join(" ");
+      return formatLaunchCommand(parts);
     },
 
     getEnvironment(config: AgentLaunchConfig): Record<string, string> {
@@ -380,11 +563,7 @@ function createCodexAgent(): Agent {
         env["AO_ISSUE_ID"] = config.issueId;
       }
 
-      // Prepend ~/.ao/bin to PATH so our gh/git wrappers intercept commands.
-      // The wrappers strip this directory from PATH before calling the real
-      // binary, so there's no infinite recursion.
-      env["PATH"] = buildAgentPath(process.env["PATH"]);
-      env["GH_PATH"] = PREFERRED_GH_PATH;
+      // PATH and GH_PATH are injected by session-manager for all agents.
       // Disable Codex's version check/update prompt for non-interactive AO sessions.
       env["CODEX_DISABLE_UPDATE_CHECK"] = "1";
 
@@ -410,7 +589,10 @@ function createCodexAgent(): Agent {
       return "active";
     },
 
-    async getActivityState(session: Session, readyThresholdMs?: number): Promise<ActivityDetection | null> {
+    async getActivityState(
+      session: Session,
+      readyThresholdMs?: number,
+    ): Promise<ActivityDetection | null> {
       const threshold = readyThresholdMs ?? DEFAULT_READY_THRESHOLD_MS;
 
       // Check if process is running first
@@ -430,26 +612,46 @@ function createCodexAgent(): Agent {
           const ageMs = Date.now() - entry.modifiedAt.getTime();
           const timestamp = entry.modifiedAt;
 
+          // Real Codex wraps the semantic type in `payload.type` on event_msg
+          // records (e.g. `{"type":"event_msg","payload":{"type":"error",...}}`).
+          // Prefer payloadType when present so approval_request/error surface
+          // correctly instead of decaying to ready/idle via the event_msg case.
+          const effectiveType = entry.payloadType ?? entry.lastType;
+
           // Map Codex JSONL entry types to activity states.
           // Confirmed types: session_meta, event_msg. Others are best-effort.
           const activeWindowMs = Math.min(DEFAULT_ACTIVE_WINDOW_MS, threshold);
-          switch (entry.lastType) {
-            case "user_input":
-            case "tool_call":
-            case "exec_command":
-              if (ageMs <= activeWindowMs) return { state: "active", timestamp };
-              return { state: ageMs > threshold ? "idle" : "ready", timestamp };
-
-            case "assistant_message":
-            case "session_meta":
-            case "event_msg":
-              return { state: ageMs > threshold ? "idle" : "ready", timestamp };
-
+          switch (effectiveType) {
             case "approval_request":
+            case "exec_approval_request":
+            case "apply_patch_approval_request":
               return { state: "waiting_input", timestamp };
 
             case "error":
+            case "stream_error":
               return { state: "blocked", timestamp };
+
+            case "task_started":
+            case "agent_reasoning":
+            case "response_item":
+            case "turn_context":
+            case "user_input":
+            case "tool_call":
+            case "exec_command":
+            case "exec_command_begin":
+            case "exec_command_end":
+              if (ageMs <= activeWindowMs) return { state: "active", timestamp };
+              return { state: ageMs > threshold ? "idle" : "ready", timestamp };
+
+            case "task_complete":
+            case "turn_aborted":
+            case "agent_message":
+            case "assistant_message":
+            case "session_meta":
+            case "event_msg":
+            case "compacted":
+            case "token_count":
+              return { state: ageMs > threshold ? "idle" : "ready", timestamp };
 
             default:
               if (ageMs <= activeWindowMs) return { state: "active", timestamp };
@@ -501,6 +703,8 @@ function createCodexAgent(): Agent {
     async isProcessRunning(handle: RuntimeHandle): Promise<boolean> {
       try {
         if (handle.runtimeName === "tmux" && handle.id) {
+          // ps -eo is Unix-only; guard against stale tmux handles on Windows
+          if (isWindows()) return false;
           const { stdout: ttyOut } = await execFileAsync(
             "tmux",
             ["list-panes", "-t", handle.id, "-F", "#{pane_tty}"],
@@ -562,35 +766,51 @@ function createCodexAgent(): Agent {
 
       const agentSessionId = basename(sessionFile, ".jsonl");
 
-      const cost: CostEstimate | undefined =
-        data.inputTokens === 0 && data.outputTokens === 0
-          ? undefined
-          : {
-              inputTokens: data.inputTokens,
-              outputTokens: data.outputTokens,
-              estimatedCostUsd:
-                (data.inputTokens / 1_000_000) * 2.5 + (data.outputTokens / 1_000_000) * 10.0,
-            };
+      let cost: CostEstimate | undefined;
+      const totalInputTokens = data.inputTokens + data.cachedTokens;
+      if (totalInputTokens > 0 || data.outputTokens > 0 || data.reasoningTokens > 0) {
+        const estimatedCostUsd =
+          (data.inputTokens / 1_000_000) * 2.5 +
+          (data.cachedTokens / 1_000_000) * 0.625 +
+          ((data.outputTokens + data.reasoningTokens) / 1_000_000) * 10.0;
+        cost = {
+          inputTokens: totalInputTokens,
+          outputTokens: data.outputTokens,
+          estimatedCostUsd,
+        };
+      }
 
       return {
         summary: data.model ? `Codex session (${data.model})` : null,
         summaryIsFallback: true,
         agentSessionId,
+        metadata: data.threadId
+          ? {
+              codexThreadId: data.threadId,
+              ...(data.model ? { codexModel: data.model } : {}),
+            }
+          : undefined,
         cost,
       };
     },
 
     async getRestoreCommand(session: Session, project: ProjectConfig): Promise<string | null> {
-      if (!session.workspacePath) return null;
+      let threadId = session.metadata?.["codexThreadId"]?.trim();
+      let model: string | null = session.metadata?.["codexModel"]?.trim() || null;
+      if (!threadId) {
+        if (!session.workspacePath) return null;
 
-      // Find the Codex session file for this workspace
-      const sessionFile = await findCodexSessionFileCached(session.workspacePath);
-      if (!sessionFile) return null;
+        // Find the Codex session file for this workspace
+        const sessionFile = await findCodexSessionFileCached(session.workspacePath);
+        if (!sessionFile) return null;
 
-      // Stream the file line-by-line to avoid loading potentially huge
-      // rollout files (100 MB+) entirely into memory.
-      const data = await streamCodexSessionData(sessionFile);
-      if (!data?.threadId) return null;
+        // Stream the file line-by-line to avoid loading potentially huge
+        // rollout files (100 MB+) entirely into memory.
+        const data = await streamCodexSessionData(sessionFile);
+        if (!data?.threadId) return null;
+        threadId = data.threadId;
+        model = data.model;
+      }
 
       // Use Codex's native `resume` subcommand for proper conversation resume.
       // This restores the full thread state, not just a text prompt re-injection.
@@ -600,20 +820,20 @@ function createCodexAgent(): Agent {
       appendNoUpdateCheckFlag(parts);
 
       appendApprovalFlags(parts, project.agentConfig?.permissions);
-      const effectiveModel = (project.agentConfig?.model ?? data.model) as string | undefined;
+      const effectiveModel = (project.agentConfig?.model ?? model) as string | undefined;
       appendModelFlags(parts, effectiveModel ?? undefined);
 
       // Positional threadId goes last, after all flags
-      parts.push(shellEscape(data.threadId));
+      parts.push(shellEscape(threadId));
 
-      return parts.join(" ");
+      return formatLaunchCommand(parts);
     },
 
-    async setupWorkspaceHooks(workspacePath: string, _config: WorkspaceHooksConfig): Promise<void> {
-      await setupPathWrapperWorkspace(workspacePath);
+    async setupWorkspaceHooks(_workspacePath: string, _config: WorkspaceHooksConfig): Promise<void> {
+      // PATH wrappers are installed by session-manager for all agents.
     },
 
-    async postLaunchSetup(session: Session): Promise<void> {
+    async postLaunchSetup(_session: Session): Promise<void> {
       // Resolve binary path on first launch (cached for subsequent calls).
       // Uses a promise guard to prevent concurrent calls from racing.
       if (!resolvedBinary) {
@@ -626,8 +846,7 @@ function createCodexAgent(): Agent {
           resolvingBinary = null;
         }
       }
-      if (!session.workspacePath) return;
-      await setupPathWrapperWorkspace(session.workspacePath);
+      // PATH wrappers are re-ensured by session-manager.
     },
   };
 }
@@ -657,7 +876,11 @@ export type {
 
 export function detect(): boolean {
   try {
-    execFileSync("codex", ["--version"], { stdio: "ignore" });
+    execFileSync("codex", ["--version"], {
+      stdio: "ignore",
+      shell: isWindows(),
+      windowsHide: true,
+    });
     return true;
   } catch {
     return false;

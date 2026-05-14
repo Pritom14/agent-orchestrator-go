@@ -2,6 +2,7 @@ import {
   shellEscape,
   readLastJsonlEntry,
   normalizeAgentPermissionMode,
+  isWindows,
   DEFAULT_READY_THRESHOLD_MS,
   DEFAULT_ACTIVE_WINDOW_MS,
   type Agent,
@@ -18,7 +19,7 @@ import {
 } from "@aoagents/ao-core";
 import { execFile, execFileSync } from "node:child_process";
 import { readdir, readFile, stat, open, writeFile, mkdir, chmod } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
@@ -81,37 +82,59 @@ fi
 
 # Construct metadata file path
 # AO_DATA_DIR is already set to the project-specific sessions directory
-metadata_file="$AO_DATA_DIR/$AO_SESSION"
+# V2 storage uses .json extension
+metadata_file="$AO_DATA_DIR/\${AO_SESSION}.json"
+
+# Fallback to bare filename for pre-migration layouts
+if [[ ! -f "$metadata_file" ]]; then
+  metadata_file="$AO_DATA_DIR/$AO_SESSION"
+fi
 
 # Ensure metadata file exists
 if [[ ! -f "$metadata_file" ]]; then
-  echo '{"systemMessage": "Metadata file not found: '"$metadata_file"'"}'
+  echo '{"systemMessage": "Metadata file not found: '"$AO_DATA_DIR/\${AO_SESSION}"'"}'
   exit 0
 fi
 
-# Update a single key in metadata
+# Detect if metadata file is JSON format
+is_json_metadata() {
+  local first_char
+  first_char=$(head -c1 "$metadata_file" 2>/dev/null)
+  [[ "$first_char" == "{" ]]
+}
+
+# Update a single key in metadata (handles both JSON and key=value formats)
 update_metadata_key() {
   local key="$1"
   local value="$2"
-
-  # Create temp file
   local temp_file="\${metadata_file}.tmp"
 
-  # Escape special sed characters in value (& | / \\)
-  local escaped_value=$(echo "$value" | sed 's/[&|\\/]/\\\\&/g')
-
-  # Check if key already exists
-  if grep -q "^$key=" "$metadata_file" 2>/dev/null; then
-    # Update existing key
-    sed "s|^$key=.*|$key=$escaped_value|" "$metadata_file" > "$temp_file"
+  if is_json_metadata; then
+    # JSON format
+    if command -v jq &>/dev/null; then
+      jq --arg k "$key" --arg v "$value" '.[$k] = $v' "$metadata_file" > "$temp_file"
+      mv "$temp_file" "$metadata_file"
+    else
+      # jq unavailable — use node (hard dep) for safe nested JSON update
+      node -e "
+        const fs = require('fs');
+        const d = JSON.parse(fs.readFileSync(process.argv[1], 'utf8'));
+        d[process.argv[2]] = process.argv[3];
+        fs.writeFileSync(process.argv[4], JSON.stringify(d, null, 2));
+      " "$metadata_file" "$key" "$value" "$temp_file"
+      mv "$temp_file" "$metadata_file"
+    fi
   else
-    # Append new key
-    cp "$metadata_file" "$temp_file"
-    echo "$key=$value" >> "$temp_file"
+    # Key=value format (legacy)
+    local escaped_value=$(echo "$value" | sed 's/[&|\\/]/\\\\&/g')
+    if grep -q "^$key=" "$metadata_file" 2>/dev/null; then
+      sed "s|^$key=.*|$key=$escaped_value|" "$metadata_file" > "$temp_file"
+    else
+      cp "$metadata_file" "$temp_file"
+      echo "$key=$value" >> "$temp_file"
+    fi
+    mv "$temp_file" "$metadata_file"
   fi
-
-  # Atomic replace
-  mv "$temp_file" "$metadata_file"
 }
 
 # ============================================================================
@@ -135,8 +158,13 @@ done
 
 # Detect: gh pr create
 if [[ "$clean_command" =~ ^gh[[:space:]]+pr[[:space:]]+create ]]; then
+  sanitized_output=$(printf '%s' "$output" | sed -E $'s/\x1B\\[[0-9;]*[A-Za-z]//g')
   # Extract PR URL from output
-  pr_url=$(echo "$output" | grep -Eo 'https://github[.]com/[^/]+/[^/]+/pull/[0-9]+' | head -1)
+  pr_url=""
+  # GitHub PR URLs are whitespace-delimited in gh output after ANSI stripping.
+  if [[ "$sanitized_output" =~ (https://github[.]com/[^[:space:]]+/[^[:space:]]+/pull/[0-9]+) ]]; then
+    pr_url="\${BASH_REMATCH[1]}"
+  fi
 
   if [[ -n "$pr_url" ]]; then
     update_metadata_key "pr" "$pr_url"
@@ -185,6 +213,173 @@ exit 0
 `;
 
 // =============================================================================
+// Metadata Updater Hook Script — Node.js (Windows)
+// =============================================================================
+
+/**
+ * Node.js equivalent of METADATA_UPDATER_SCRIPT for Windows.
+ * Reads JSON from stdin, parses it with Node built-ins, and updates the
+ * key=value metadata file.  No bash, jq, grep, sed, or chmod needed.
+ * Exported for testing.
+ */
+export const METADATA_UPDATER_SCRIPT_NODE = `#!/usr/bin/env node
+// Metadata Updater Hook for Agent Orchestrator (Node.js — Windows)
+//
+// This PostToolUse hook automatically updates session metadata when:
+// - gh pr create: extracts PR URL and writes to metadata
+// - git checkout -b / git switch -c: extracts branch name and writes to metadata
+// - gh pr merge: updates status to "merged"
+
+const { readFileSync, writeFileSync, renameSync, existsSync, realpathSync } = require("node:fs");
+const { join, sep, resolve: resolvePath } = require("node:path");
+const os = require("node:os");
+
+const AO_DATA_DIR = process.env.AO_DATA_DIR || join(process.env.HOME || process.env.USERPROFILE || "", ".ao-sessions");
+const AO_SESSION = process.env.AO_SESSION || "";
+
+// Read hook input from stdin (fd 0 is cross-platform, no /dev/stdin needed)
+let inputRaw = "";
+try {
+  inputRaw = readFileSync(0, "utf-8");
+} catch {
+  inputRaw = "";
+}
+
+let input;
+try {
+  input = JSON.parse(inputRaw || "{}");
+} catch {
+  process.stdout.write("{}\\n");
+  process.exit(0);
+}
+
+const toolName = input.tool_name || "";
+const command = (input.tool_input && input.tool_input.command) || "";
+const output = input.tool_response || "";
+const exitCode = typeof input.exit_code === "number" ? input.exit_code : 0;
+
+// Only process successful commands
+if (exitCode !== 0) {
+  process.stdout.write("{}\\n");
+  process.exit(0);
+}
+
+// Only process Bash tool calls
+if (toolName !== "Bash") {
+  process.stdout.write("{}\\n");
+  process.exit(0);
+}
+
+// Validate AO_SESSION is set
+if (!AO_SESSION) {
+  process.stdout.write(JSON.stringify({ systemMessage: "AO_SESSION environment variable not set, skipping metadata update" }) + "\\n");
+  process.exit(0);
+}
+
+// Validate AO_SESSION contains no path traversal components
+if (AO_SESSION.includes("/") || AO_SESSION.includes("\\\\") || AO_SESSION.includes("..")) {
+  process.stdout.write(JSON.stringify({ systemMessage: "AO_SESSION contains invalid path characters, skipping metadata update" }) + "\\n");
+  process.exit(0);
+}
+
+// Validate AO_DATA_DIR is within an allowed base directory (mirrors ao-metadata-helper.sh)
+const home = os.homedir();
+let resolvedAoDir;
+try { resolvedAoDir = realpathSync(AO_DATA_DIR); } catch { resolvedAoDir = resolvePath(AO_DATA_DIR); }
+const allowedBases = [join(home, ".ao"), join(home, ".agent-orchestrator"), os.tmpdir()];
+if (!allowedBases.some((a) => resolvedAoDir === a || resolvedAoDir.startsWith(a + sep))) {
+  process.stdout.write(JSON.stringify({ systemMessage: "AO_DATA_DIR is outside allowed directories, skipping metadata update" }) + "\\n");
+  process.exit(0);
+}
+
+const metadataFile = join(AO_DATA_DIR, AO_SESSION);
+
+if (!existsSync(metadataFile)) {
+  process.stdout.write(JSON.stringify({ systemMessage: "Metadata file not found: " + metadataFile }) + "\\n");
+  process.exit(0);
+}
+
+/**
+ * Update or append a key=value line in the metadata file (atomic via temp file).
+ */
+function updateMetadataKey(key, value) {
+  const lines = readFileSync(metadataFile, "utf-8").split("\\n");
+  let found = false;
+  const updated = lines.map((line) => {
+    if (line.startsWith(key + "=")) {
+      found = true;
+      return key + "=" + value;
+    }
+    return line;
+  });
+  if (!found) {
+    // Insert before the trailing empty line (if any) so the file ends cleanly
+    updated.push(key + "=" + value);
+  }
+  const tmpFile = metadataFile + ".tmp." + process.pid;
+  writeFileSync(tmpFile, updated.join("\\n"), "utf-8");
+  renameSync(tmpFile, metadataFile);
+}
+
+// Strip leading cd ... && / cd ... ; prefixes (agents frequently cd into a
+// worktree before running the real command)
+let cleanCommand = command;
+const cdPrefixRe = /^\\s*cd\\s+\\S.*?\\s+(?:&&|;)\\s+(.*)/;
+let m;
+while ((m = cdPrefixRe.exec(cleanCommand)) !== null && /^\\s*cd\\s/.test(cleanCommand)) {
+  cleanCommand = m[1];
+}
+
+// Detect: gh pr create
+if (/^gh\\s+pr\\s+create/.test(cleanCommand)) {
+  const prMatch = output.match(/https:\\/\\/github[.]com\\/[^/]+\\/[^/]+\\/pull\\/\\d+/);
+  if (prMatch) {
+    const prUrl = prMatch[0];
+    updateMetadataKey("pr", prUrl);
+    updateMetadataKey("status", "pr_open");
+    process.stdout.write(JSON.stringify({ systemMessage: "Updated metadata: PR created at " + prUrl }) + "\\n");
+    process.exit(0);
+  }
+}
+
+// Detect: git checkout -b <branch> or git switch -c <branch>
+const checkoutNewBranch = cleanCommand.match(/^git\\s+checkout\\s+-b\\s+(\\S+)/) ||
+  cleanCommand.match(/^git\\s+switch\\s+-c\\s+(\\S+)/);
+if (checkoutNewBranch) {
+  const branch = checkoutNewBranch[1];
+  if (branch) {
+    updateMetadataKey("branch", branch);
+    process.stdout.write(JSON.stringify({ systemMessage: "Updated metadata: branch = " + branch }) + "\\n");
+    process.exit(0);
+  }
+}
+
+// Detect: git checkout <branch> or git switch <branch> (without -b/-c)
+// Only update if branch looks like a feature branch (contains / or -)
+const checkoutBranch = cleanCommand.match(/^git\\s+checkout\\s+([^\\s-]+[/-][^\\s]+)/) ||
+  cleanCommand.match(/^git\\s+switch\\s+([^\\s-]+[/-][^\\s]+)/);
+if (checkoutBranch) {
+  const branch = checkoutBranch[1];
+  if (branch && branch !== "HEAD") {
+    updateMetadataKey("branch", branch);
+    process.stdout.write(JSON.stringify({ systemMessage: "Updated metadata: branch = " + branch }) + "\\n");
+    process.exit(0);
+  }
+}
+
+// Detect: gh pr merge
+if (/^gh\\s+pr\\s+merge/.test(cleanCommand)) {
+  updateMetadataKey("status", "merged");
+  process.stdout.write(JSON.stringify({ systemMessage: "Updated metadata: status = merged" }) + "\\n");
+  process.exit(0);
+}
+
+// No matching command
+process.stdout.write("{}\\n");
+process.exit(0);
+`;
+
+// =============================================================================
 // Plugin Manifest
 // =============================================================================
 
@@ -204,21 +399,22 @@ export const manifest = {
  * Convert a workspace path to Claude's project directory path.
  * Claude stores sessions at ~/.claude/projects/{encoded-path}/
  *
- * Verified against Claude Code's actual encoding (as of v1.x):
- * the path has its leading / stripped, then all / and . are replaced with -.
- * e.g. /Users/dev/.worktrees/ao → Users-dev--worktrees-ao
+ * Verified against Claude Code's actual on-disk slugs: every non-alphanumeric
+ * character (other than `-`) is replaced with `-`. That includes `/`, `.`,
+ * `:`, and crucially `_` — AO's per-project data dirs are named like
+ * `<sanitized>_<hash>`, and without underscore folding the slug AO computes
+ * misses the directory Claude actually wrote (issue #1611).
  *
- * If Claude Code changes its encoding scheme this will silently break
- * introspection. The path can be validated at runtime by checking whether
- * the resulting directory exists.
+ * Windows: `C:\Users\dev\project` → `C--Users-dev-project` — Claude leaves the
+ * colon-position as a dash rather than stripping it. Verified via on-disk QA
+ * during the Windows port (commit 582c5373). Stripping the colon (as #1611
+ * inadvertently did) breaks JSONL lookup on Windows.
  *
  * Exported for testing purposes.
  */
 export function toClaudeProjectPath(workspacePath: string): string {
-  // Handle Windows drive letters (C:\Users\... → C-Users-...)
   const normalized = workspacePath.replace(/\\/g, "/");
-  // Claude Code replaces / and . with - (keeping the leading slash as a leading -)
-  return normalized.replace(/:/g, "").replace(/[/.]/g, "-");
+  return normalized.replace(/[^a-zA-Z0-9-]/g, "-");
 }
 
 /** Find the most recently modified .jsonl session file in a directory */
@@ -307,8 +503,7 @@ async function parseJsonlFileTail(filePath: string, maxBytes = 131_072): Promise
   // Skip potentially truncated first line only when we started mid-file.
   // If offset === 0 we read from the start so the first line is complete.
   const firstNewline = content.indexOf("\n");
-  const safeContent =
-    offset > 0 && firstNewline >= 0 ? content.slice(firstNewline + 1) : content;
+  const safeContent = offset > 0 && firstNewline >= 0 ? content.slice(firstNewline + 1) : content;
   const lines: JsonlLine[] = [];
   for (const line of safeContent.split("\n")) {
     const trimmed = line.trim();
@@ -326,9 +521,7 @@ async function parseJsonlFileTail(filePath: string, maxBytes = 131_072): Promise
 }
 
 /** Extract auto-generated summary from JSONL (last "summary" type entry) */
-function extractSummary(
-  lines: JsonlLine[],
-): { summary: string; isFallback: boolean } | null {
+function extractSummary(lines: JsonlLine[]): { summary: string; isFallback: boolean } | null {
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i];
     if (line?.type === "summary" && line.summary) {
@@ -358,6 +551,8 @@ function extractSummary(
 function extractCost(lines: JsonlLine[]): CostEstimate | undefined {
   let inputTokens = 0;
   let outputTokens = 0;
+  let cachedReadTokens = 0;
+  let cacheCreationTokens = 0;
   let totalCost = 0;
 
   for (const line of lines) {
@@ -373,8 +568,8 @@ function extractCost(lines: JsonlLine[]): CostEstimate | undefined {
     // double-counting if a line contains both.
     if (line.usage) {
       inputTokens += line.usage.input_tokens ?? 0;
-      inputTokens += line.usage.cache_read_input_tokens ?? 0;
-      inputTokens += line.usage.cache_creation_input_tokens ?? 0;
+      cachedReadTokens += line.usage.cache_read_input_tokens ?? 0;
+      cacheCreationTokens += line.usage.cache_creation_input_tokens ?? 0;
       outputTokens += line.usage.output_tokens ?? 0;
     } else {
       if (typeof line.inputTokens === "number") {
@@ -386,19 +581,29 @@ function extractCost(lines: JsonlLine[]): CostEstimate | undefined {
     }
   }
 
-  if (inputTokens === 0 && outputTokens === 0 && totalCost === 0) {
+  if (
+    inputTokens === 0 &&
+    outputTokens === 0 &&
+    totalCost === 0 &&
+    cachedReadTokens === 0 &&
+    cacheCreationTokens === 0
+  ) {
     return undefined;
   }
 
-  // Rough estimate when no direct cost data — uses Sonnet 4.5 pricing as a
-  // baseline. Will be inaccurate for other models (Opus, Haiku) but provides
-  // a useful order-of-magnitude signal. TODO: make pricing configurable or
-  // infer from model field in JSONL.
-  if (totalCost === 0 && (inputTokens > 0 || outputTokens > 0)) {
-    totalCost = (inputTokens / 1_000_000) * 3.0 + (outputTokens / 1_000_000) * 15.0;
+  if (totalCost === 0) {
+    totalCost =
+      (inputTokens / 1_000_000) * 3.0 +
+      (outputTokens / 1_000_000) * 15.0 +
+      (cachedReadTokens / 1_000_000) * 0.3 +
+      (cacheCreationTokens / 1_000_000) * 3.75;
   }
 
-  return { inputTokens, outputTokens, estimatedCostUsd: totalCost };
+  return {
+    inputTokens: inputTokens + cachedReadTokens + cacheCreationTokens,
+    outputTokens,
+    estimatedCostUsd: totalCost,
+  };
 }
 
 // =============================================================================
@@ -420,6 +625,10 @@ export function resetPsCache(): void {
 }
 
 async function getCachedProcessList(): Promise<string> {
+  // ps -eo is a Unix-only command; on Windows the tmux branch is never taken
+  // in normal operation, but guard here to avoid a spurious spawn error if
+  // a stale tmux handle is encountered.
+  if (isWindows()) return "";
   const now = Date.now();
   if (psCache && now - psCache.timestamp < PS_CACHE_TTL_MS) {
     // Cache hit — return resolved output or wait for in-flight request
@@ -559,10 +768,9 @@ function classifyTerminalOutput(terminalOutput: string): ActivityState {
  * @param workspacePath - Path to the workspace directory
  * @param hookCommand - Command string for the hook (can use variables like $CLAUDE_PROJECT_DIR)
  */
-async function setupHookInWorkspace(workspacePath: string, hookCommand: string): Promise<void> {
+async function setupHookInWorkspace(workspacePath: string): Promise<void> {
   const claudeDir = join(workspacePath, ".claude");
   const settingsPath = join(claudeDir, "settings.json");
-  const hookScriptPath = join(claudeDir, "metadata-updater.sh");
 
   // Create .claude directory if it doesn't exist
   try {
@@ -571,9 +779,22 @@ async function setupHookInWorkspace(workspacePath: string, hookCommand: string):
     // Directory might already exist
   }
 
-  // Write the metadata updater script
-  await writeFile(hookScriptPath, METADATA_UPDATER_SCRIPT, "utf-8");
-  await chmod(hookScriptPath, 0o755); // Make executable
+  // On Windows: write a Node.js hook script, skip chmod (not needed).
+  // On Unix: write the bash hook script and make it executable.
+  let hookCommand: string;
+  if (isWindows()) {
+    const hookScriptPath = join(claudeDir, "metadata-updater.cjs");
+    await writeFile(hookScriptPath, METADATA_UPDATER_SCRIPT_NODE, "utf-8");
+    // No chmod — Windows uses file extension for executability
+    // Use `node` to invoke the script (Windows won't run .js via shebang)
+    // Use .cjs extension to force CJS mode regardless of workspace package.json "type" field
+    hookCommand = "node .claude/metadata-updater.cjs";
+  } else {
+    const hookScriptPath = join(claudeDir, "metadata-updater.sh");
+    await writeFile(hookScriptPath, METADATA_UPDATER_SCRIPT, "utf-8");
+    await chmod(hookScriptPath, 0o755); // Make executable
+    hookCommand = ".claude/metadata-updater.sh";
+  }
 
   // Read existing settings if present
   let existingSettings: Record<string, unknown> = {};
@@ -603,7 +824,12 @@ async function setupHookInWorkspace(workspacePath: string, hookCommand: string):
       const hDef = hooksList[j];
       if (typeof hDef !== "object" || hDef === null || Array.isArray(hDef)) continue;
       const def = hDef as Record<string, unknown>;
-      if (typeof def["command"] === "string" && def["command"].includes("metadata-updater.sh")) {
+      if (
+        typeof def["command"] === "string" &&
+        (def["command"].includes("metadata-updater.sh") ||
+          def["command"].includes("metadata-updater.js") ||
+          def["command"].includes("metadata-updater.cjs"))
+      ) {
         hookIndex = i;
         hookDefIndex = j;
         break;
@@ -647,8 +873,6 @@ function createClaudeCodeAgent(): Agent {
   return {
     name: "claude-code",
     processName: "claude",
-    promptDelivery: "post-launch",
-
     getLaunchCommand(config: AgentLaunchConfig): string {
       // Note: CLAUDECODE is unset via getEnvironment() (set to ""), not here.
       // This command must be safe for both shell and execFile contexts.
@@ -664,17 +888,27 @@ function createClaudeCodeAgent(): Agent {
       }
 
       if (config.systemPromptFile) {
-        // Use shell command substitution to read from file at launch time.
-        // This avoids tmux truncation when inlining 2000+ char prompts.
-        // The double quotes allow $() expansion; inner path is single-quoted for safety.
-        parts.push("--append-system-prompt", `"$(cat ${shellEscape(config.systemPromptFile)})"`);
+        if (isWindows()) {
+          // Windows: $(cat ...) is bash syntax, not understood by PowerShell/cmd.exe.
+          // Read the file synchronously and inline the content instead.
+          const content = readFileSync(config.systemPromptFile, "utf-8");
+          parts.push("--append-system-prompt", shellEscape(content));
+        } else {
+          // Unix: use shell command substitution to read from file at launch time.
+          // This avoids tmux truncation when inlining 2000+ char prompts.
+          // The double quotes allow $() expansion; inner path is single-quoted for safety.
+          parts.push("--append-system-prompt", `"$(cat ${shellEscape(config.systemPromptFile)})"`);
+        }
       } else if (config.systemPrompt) {
         parts.push("--append-system-prompt", shellEscape(config.systemPrompt));
       }
 
-      // NOTE: prompt is NOT included here — it's delivered post-launch via
-      // runtime.sendMessage() to keep Claude in interactive mode.
-      // Using -p causes one-shot mode (Claude exits after responding).
+      // The positional [prompt] argument auto-submits as the first user turn
+      // and keeps Claude in interactive mode. -p / --print is what triggers
+      // headless one-shot exit, not the presence of a prompt.
+      if (config.prompt) {
+        parts.push("--", shellEscape(config.prompt));
+      }
 
       return parts.join(" ");
     },
@@ -750,6 +984,12 @@ function createClaudeCodeAgent(): Agent {
         return null;
       }
 
+      // If the JSONL entry predates this session, it's from a previous session
+      // in the same worktree. Treat as no data (agent hasn't written yet).
+      if (session.createdAt && entry.modifiedAt < session.createdAt) {
+        return { state: "idle", timestamp: session.createdAt };
+      }
+
       const ageMs = Date.now() - entry.modifiedAt.getTime();
       const timestamp = entry.modifiedAt;
 
@@ -802,23 +1042,27 @@ function createClaudeCodeAgent(): Agent {
         summary: summaryResult?.summary ?? null,
         summaryIsFallback: summaryResult?.isFallback,
         agentSessionId,
+        metadata: { claudeSessionUuid: agentSessionId },
         cost: extractCost(lines),
       };
     },
 
     async getRestoreCommand(session: Session, project: ProjectConfig): Promise<string | null> {
-      if (!session.workspacePath) return null;
+      let sessionUuid = session.metadata?.["claudeSessionUuid"]?.trim();
+      if (!sessionUuid) {
+        if (!session.workspacePath) return null;
 
-      // Find Claude's project directory for this workspace
-      const projectPath = toClaudeProjectPath(session.workspacePath);
-      const projectDir = join(homedir(), ".claude", "projects", projectPath);
+        // Find Claude's project directory for this workspace
+        const projectPath = toClaudeProjectPath(session.workspacePath);
+        const projectDir = join(homedir(), ".claude", "projects", projectPath);
 
-      // Find the latest session JSONL file
-      const sessionFile = await findLatestSessionFile(projectDir);
-      if (!sessionFile) return null;
+        // Find the latest session JSONL file
+        const sessionFile = await findLatestSessionFile(projectDir);
+        if (!sessionFile) return null;
 
-      // Extract session UUID from filename (e.g. "abc123-def456.jsonl" → "abc123-def456")
-      const sessionUuid = basename(sessionFile, ".jsonl");
+        // Extract session UUID from filename (e.g. "abc123-def456.jsonl" → "abc123-def456")
+        sessionUuid = basename(sessionFile, ".jsonl");
+      }
       if (!sessionUuid) return null;
 
       // Build resume command
@@ -839,13 +1083,12 @@ function createClaudeCodeAgent(): Agent {
     async setupWorkspaceHooks(workspacePath: string, _config: WorkspaceHooksConfig): Promise<void> {
       // Relative path so that symlinked .claude/ dirs across worktrees
       // all produce the same settings.json (last writer doesn't clobber).
-      await setupHookInWorkspace(workspacePath, ".claude/metadata-updater.sh");
+      await setupHookInWorkspace(workspacePath);
     },
 
-    async postLaunchSetup(session: Session): Promise<void> {
-      if (!session.workspacePath) return;
-
-      await setupHookInWorkspace(session.workspacePath, ".claude/metadata-updater.sh");
+    async postLaunchSetup(_session: Session): Promise<void> {
+      // Hooks are installed pre-launch via setupWorkspaceHooks so that
+      // PostToolUse hooks exist before the agent's first tool call.
     },
   };
 }
@@ -860,8 +1103,13 @@ export function create(): Agent {
 
 export function detect(): boolean {
   try {
-    // Use --version instead of `which` for cross-platform compatibility (Windows has no `which`)
-    execFileSync("claude", ["--version"], { stdio: "ignore" });
+    // Use --version instead of `which` for cross-platform compatibility (Windows has no `which`).
+    // shell:true on Windows so cmd.exe consults PATHEXT and finds .cmd shims (npm-installed CLIs).
+    execFileSync("claude", ["--version"], {
+      stdio: "ignore",
+      shell: isWindows(),
+      windowsHide: true,
+    });
     return true;
   } catch {
     return false;

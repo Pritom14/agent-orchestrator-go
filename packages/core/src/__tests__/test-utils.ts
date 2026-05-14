@@ -3,11 +3,15 @@ import { mkdirSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
-import { getSessionsDir, getProjectBaseDir } from "../paths.js";
+import { getProjectSessionsDir, getProjectDir } from "../paths.js";
+import { resetOpenCodeSessionListCache } from "../session-manager.js";
+import { closeDb } from "../events-db.js";
+import { createInitialCanonicalLifecycle, deriveLegacyStatus } from "../lifecycle-state.js";
+import { createActivitySignal } from "../activity-signal.js";
 import type {
   OrchestratorConfig,
   PluginRegistry,
-  SessionManager,
+  OpenCodeSessionManager,
   Session,
   Runtime,
   RuntimeHandle,
@@ -28,11 +32,76 @@ export function makeHandle(id: string): RuntimeHandle {
 }
 
 export function makeSession(overrides: Partial<Session> = {}): Session {
-  return {
+  const lifecycle = createInitialCanonicalLifecycle("worker", new Date());
+  const requestedStatus = overrides.status ?? "working";
+  switch (requestedStatus) {
+    case "spawning":
+      lifecycle.session.state = "not_started";
+      lifecycle.session.reason = "spawn_requested";
+      break;
+    case "needs_input":
+      lifecycle.session.state = "needs_input";
+      lifecycle.session.reason = "awaiting_user_input";
+      lifecycle.session.startedAt = lifecycle.session.lastTransitionAt;
+      break;
+    case "stuck":
+      lifecycle.session.state = "stuck";
+      lifecycle.session.reason = "probe_failure";
+      lifecycle.session.startedAt = lifecycle.session.lastTransitionAt;
+      break;
+    case "errored":
+      lifecycle.session.state = "terminated";
+      lifecycle.session.reason = "error_in_process";
+      lifecycle.session.startedAt = lifecycle.session.lastTransitionAt;
+      lifecycle.session.terminatedAt = lifecycle.session.lastTransitionAt;
+      lifecycle.runtime.state = "missing";
+      lifecycle.runtime.reason = "process_missing";
+      break;
+    case "merged":
+      lifecycle.session.state = "idle";
+      lifecycle.session.reason = "merged_waiting_decision";
+      lifecycle.session.startedAt = lifecycle.session.lastTransitionAt;
+      lifecycle.pr.state = "merged";
+      lifecycle.pr.reason = "merged";
+      break;
+    case "done":
+      lifecycle.session.state = "done";
+      lifecycle.session.reason = "research_complete";
+      lifecycle.session.startedAt = lifecycle.session.lastTransitionAt;
+      lifecycle.session.completedAt = lifecycle.session.lastTransitionAt;
+      break;
+    case "killed":
+    case "terminated":
+    case "cleanup":
+      lifecycle.session.state = "terminated";
+      lifecycle.session.reason = "manually_killed";
+      lifecycle.session.startedAt = lifecycle.session.lastTransitionAt;
+      lifecycle.session.terminatedAt = lifecycle.session.lastTransitionAt;
+      lifecycle.runtime.state = "missing";
+      lifecycle.runtime.reason = "manual_kill_requested";
+      break;
+    default:
+      lifecycle.session.state = "working";
+      lifecycle.session.reason = "task_in_progress";
+      lifecycle.session.startedAt = lifecycle.session.lastTransitionAt;
+      break;
+  }
+  if (lifecycle.session.state !== "terminated") {
+    lifecycle.runtime.state = "alive";
+    lifecycle.runtime.reason = "process_running";
+  }
+  lifecycle.runtime.handle = { id: "rt-1", runtimeName: "mock", data: {} };
+  const base: Session = {
     id: "app-1",
     projectId: "my-app",
-    status: "spawning",
+    status: deriveLegacyStatus(lifecycle),
     activity: "active",
+    activitySignal: createActivitySignal("valid", {
+      activity: "active",
+      timestamp: new Date(),
+      source: "native",
+    }),
+    lifecycle,
     branch: "feat/test",
     issueId: null,
     pr: null,
@@ -42,17 +111,21 @@ export function makeSession(overrides: Partial<Session> = {}): Session {
     createdAt: new Date(),
     lastActivityAt: new Date(),
     metadata: {},
+  };
+  return {
+    ...base,
     ...overrides,
+    lifecycle: overrides.lifecycle ?? lifecycle,
   };
 }
 
 export function makePR(overrides: Partial<PRInfo> = {}): PRInfo {
   return {
     number: 42,
-    url: "https://github.com/org/repo/pull/42",
+    url: "https://github.com/org/my-app/pull/42",
     title: "Fix things",
     owner: "org",
-    repo: "repo",
+    repo: "my-app",
     branch: "feat/test",
     baseBranch: "main",
     isDraft: false,
@@ -101,13 +174,14 @@ export function createMockPlugins(): MockPlugins {
     }),
     destroy: vi.fn().mockResolvedValue(undefined),
     list: vi.fn().mockResolvedValue([]),
+    findManagedWorkspace: vi.fn().mockResolvedValue(null),
   };
 
   return { runtime, agent, workspace };
 }
 
 export function createMockSCM(overrides: Partial<SCM> = {}): SCM {
-  return {
+  const scm: SCM = {
     name: "github",
     detectPR: vi.fn().mockResolvedValue(null),
     getPRState: vi.fn().mockResolvedValue("open"),
@@ -118,7 +192,7 @@ export function createMockSCM(overrides: Partial<SCM> = {}): SCM {
     getReviews: vi.fn().mockResolvedValue([]),
     getReviewDecision: vi.fn().mockResolvedValue("none"),
     getPendingComments: vi.fn().mockResolvedValue([]),
-    getAutomatedComments: vi.fn().mockResolvedValue([]),
+    getReviewThreads: vi.fn().mockResolvedValue({ threads: [], reviews: [] }),
     getMergeability: vi.fn().mockResolvedValue({
       mergeable: false,
       ciPassing: true,
@@ -126,8 +200,33 @@ export function createMockSCM(overrides: Partial<SCM> = {}): SCM {
       noConflicts: true,
       blockers: [],
     }),
+    // Default batch mock: resolves individual method mocks at call time
+    // so tests that override getPRState/getCISummary/etc. automatically
+    // get matching batch enrichment without explicit enrichSessionsPRBatch.
+    enrichSessionsPRBatch: vi.fn().mockImplementation(async (prs: PRInfo[]) => {
+      const result = new Map();
+      for (const pr of prs) {
+        const [state, ciStatus, reviewDecision, mergeability, ciChecks] = await Promise.all([
+          scm.getPRState(pr),
+          scm.getCISummary(pr),
+          scm.getReviewDecision(pr),
+          scm.getMergeability(pr),
+          scm.getCIChecks(pr),
+        ]);
+        result.set(`${pr.owner}/${pr.repo}#${pr.number}`, {
+          state: state ?? "open",
+          ciStatus: ciStatus ?? "passing",
+          reviewDecision: reviewDecision ?? "none",
+          mergeable: mergeability?.mergeable ?? false,
+          hasConflicts: mergeability ? !mergeability.noConflicts : false,
+          ciChecks: ciChecks ?? [],
+        });
+      }
+      return result;
+    }),
     ...overrides,
   };
+  return scm;
 }
 
 export function createMockNotifier(): Notifier {
@@ -149,7 +248,10 @@ export interface RegistryPlugins {
   notifier?: Notifier;
 }
 
-export function createMockRegistry(plugins: RegistryPlugins, options: { strict?: boolean } = {}): PluginRegistry {
+export function createMockRegistry(
+  plugins: RegistryPlugins,
+  options: { strict?: boolean } = {},
+): PluginRegistry {
   return {
     register: vi.fn(),
     get: vi.fn().mockImplementation((slot: string, name?: string) => {
@@ -175,8 +277,6 @@ export function createMockRegistry(plugins: RegistryPlugins, options: { strict?:
         if (!options.strict) return plugins.notifier;
       }
 
-
-
       return null;
     }),
     list: vi.fn().mockReturnValue([]),
@@ -200,6 +300,12 @@ export interface TestEnvironment {
 export function createTestEnvironment(): TestEnvironment {
   const tmpDir = join(tmpdir(), `ao-test-lifecycle-${randomUUID()}`);
   mkdirSync(tmpDir, { recursive: true });
+  const previousHome = process.env["HOME"];
+  const previousUserProfile = process.env["USERPROFILE"];
+  process.env["HOME"] = tmpDir;
+  // os.homedir() on Windows reads USERPROFILE, not HOME — must override both
+  // or parallel vitest workers share the real home dir and race on storage.
+  process.env["USERPROFILE"] = tmpDir;
 
   const configPath = join(tmpDir, "agent-orchestrator.yaml");
   writeFileSync(configPath, "projects: {}\n");
@@ -235,15 +341,30 @@ export function createTestEnvironment(): TestEnvironment {
     readyThresholdMs: 300_000,
   };
 
-  const sessionsDir = getSessionsDir(configPath, join(tmpDir, "my-app"));
+  const sessionsDir = getProjectSessionsDir("my-app");
   mkdirSync(sessionsDir, { recursive: true });
 
   const cleanup = () => {
-    const projectBaseDir = getProjectBaseDir(configPath, join(tmpDir, "my-app"));
-    if (existsSync(projectBaseDir)) {
-      rmSync(projectBaseDir, { recursive: true, force: true });
+    if (previousHome === undefined) {
+      delete process.env["HOME"];
+    } else {
+      process.env["HOME"] = previousHome;
     }
-    rmSync(tmpDir, { recursive: true, force: true });
+    if (previousUserProfile === undefined) {
+      delete process.env["USERPROFILE"];
+    } else {
+      process.env["USERPROFILE"] = previousUserProfile;
+    }
+    // V2 storage: project files live under getProjectDir(projectId).
+    // maxRetries handles Windows EBUSY (antivirus/indexer transient locks).
+    // closeDb releases the better-sqlite3 lock on activity-events.db so
+    // Windows can unlink it; without this rmSync fails with EBUSY.
+    closeDb();
+    const projectDir = getProjectDir("my-app");
+    if (existsSync(projectDir)) {
+      rmSync(projectDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    }
+    rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   };
 
   return { tmpDir, configPath, sessionsDir, config, cleanup };
@@ -263,18 +384,30 @@ export interface TestContext {
   mockRegistry: PluginRegistry;
   config: OrchestratorConfig;
   originalPath: string | undefined;
+  originalHome: string | undefined;
+  originalUserProfile: string | undefined;
 }
 
 export function setupTestContext(): TestContext {
+  resetOpenCodeSessionListCache();
   const originalPath = process.env.PATH;
+  const originalHome = process.env["HOME"];
+  const originalUserProfile = process.env["USERPROFILE"];
   const tmpDir = join(tmpdir(), `ao-test-session-mgr-${randomUUID()}`);
   mkdirSync(tmpDir, { recursive: true });
+  process.env["HOME"] = tmpDir;
+  // os.homedir() reads USERPROFILE on Windows, not HOME
+  process.env["USERPROFILE"] = tmpDir;
 
   const configPath = join(tmpDir, "agent-orchestrator.yaml");
   writeFileSync(configPath, "projects: {}\n");
 
   const { runtime: mockRuntime, agent: mockAgent, workspace: mockWorkspace } = createMockPlugins();
-  const mockRegistry = createMockRegistry({ runtime: mockRuntime, agent: mockAgent, workspace: mockWorkspace });
+  const mockRegistry = createMockRegistry({
+    runtime: mockRuntime,
+    agent: mockAgent,
+    workspace: mockWorkspace,
+  });
 
   const config: OrchestratorConfig = {
     configPath,
@@ -308,7 +441,7 @@ export function setupTestContext(): TestContext {
     readyThresholdMs: 300_000,
   };
 
-  const sessionsDir = getSessionsDir(configPath, join(tmpDir, "my-app"));
+  const sessionsDir = getProjectSessionsDir("my-app");
   mkdirSync(sessionsDir, { recursive: true });
 
   return {
@@ -321,30 +454,58 @@ export function setupTestContext(): TestContext {
     mockRegistry,
     config,
     originalPath,
+    originalHome,
+    originalUserProfile,
   };
 }
 
 export function teardownTestContext(ctx: TestContext): void {
   process.env.PATH = ctx.originalPath;
-  const projectBaseDir = getProjectBaseDir(ctx.configPath, join(ctx.tmpDir, "my-app"));
-  if (existsSync(projectBaseDir)) {
-    rmSync(projectBaseDir, { recursive: true, force: true });
+  if (ctx.originalHome === undefined) {
+    delete process.env["HOME"];
+  } else {
+    process.env["HOME"] = ctx.originalHome;
   }
-  rmSync(ctx.tmpDir, { recursive: true, force: true });
+  if (ctx.originalUserProfile === undefined) {
+    delete process.env["USERPROFILE"];
+  } else {
+    process.env["USERPROFILE"] = ctx.originalUserProfile;
+  }
+  // closeDb releases the activity-events.db SQLite lock so Windows can
+  // unlink the file; rmSync's maxRetries alone doesn't break the lock.
+  closeDb();
+  // V2 storage: getProjectDir(projectId). Retry options handle Windows EBUSY.
+  const projectDir = getProjectDir("my-app");
+  if (existsSync(projectDir)) {
+    rmSync(projectDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+  rmSync(ctx.tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 }
 
 // ---------------------------------------------------------------------------
 // Session manager mock
 // ---------------------------------------------------------------------------
 
-export function createMockSessionManager(): SessionManager {
+export function createMockSessionManager(): OpenCodeSessionManager {
   return {
     spawn: vi.fn().mockResolvedValue(makeSession()),
-    spawnOrchestrator: vi.fn().mockResolvedValue(makeSession({ id: "app-orchestrator", metadata: { role: "orchestrator" } })),
+    spawnOrchestrator: vi
+      .fn()
+      .mockResolvedValue(
+        makeSession({ id: "app-orchestrator", metadata: { role: "orchestrator" } }),
+      ),
+    ensureOrchestrator: vi
+      .fn()
+      .mockResolvedValue(
+        makeSession({ id: "app-orchestrator", metadata: { role: "orchestrator" } }),
+      ),
     restore: vi.fn().mockResolvedValue(makeSession()),
     list: vi.fn().mockResolvedValue([]),
+    listCached: vi.fn().mockResolvedValue([]),
+    invalidateCache: vi.fn(),
+    remap: vi.fn().mockResolvedValue("app-1"),
     get: vi.fn().mockResolvedValue(null),
-    kill: vi.fn().mockResolvedValue(undefined),
+    kill: vi.fn().mockResolvedValue({ cleaned: true, alreadyTerminated: false }),
     cleanup: vi.fn().mockResolvedValue({ killed: [], skipped: [], errors: [] }),
     send: vi.fn().mockResolvedValue(undefined),
     claimPR: vi.fn().mockResolvedValue({
@@ -355,5 +516,5 @@ export function createMockSessionManager(): SessionManager {
       githubAssigned: true,
       takenOverFrom: [],
     }),
-  } as SessionManager;
+  } as OpenCodeSessionManager;
 }

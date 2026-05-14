@@ -135,7 +135,17 @@ export function registerSend(program: Command): void {
           sessionManager,
         } = await resolveSessionContext(session);
 
-        const message = await readMessageInput(opts, messageParts);
+        const rawMessage = await readMessageInput(opts, messageParts);
+        // Auto-prefix with the sender's session ID when ao send is invoked
+        // from inside an AO session (worker → orchestrator, orchestrator →
+        // worker, worker → worker). The receiver gets the message as raw
+        // terminal input with no `from:` metadata, so the prefix is the only
+        // way to identify who's writing. Humans running ao send from their
+        // own terminal have no AO_SESSION_ID and stay unprefixed.
+        const senderSessionId = process.env["AO_SESSION_ID"];
+        const message = senderSessionId
+          ? `[from ${senderSessionId}] ${rawMessage}`
+          : rawMessage;
 
         const parsedTimeout = parseInt(opts.timeout || "600", 10);
         const timeoutMs = (isNaN(parsedTimeout) || parsedTimeout <= 0 ? 600 : parsedTimeout) * 1000;
@@ -184,8 +194,13 @@ export function registerSend(program: Command): void {
         }
 
         if (existingSession && sessionManager) {
-          await sessionManager.send(session, message);
-          console.log(chalk.green("Message sent and processing"));
+          try {
+            await sessionManager.send(session, message);
+            console.log(chalk.green("Message sent and processing"));
+          } catch (err) {
+            console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+            process.exit(1);
+          }
           return;
         }
 

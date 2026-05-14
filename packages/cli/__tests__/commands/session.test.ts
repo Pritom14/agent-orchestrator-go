@@ -17,8 +17,11 @@ import {
   type CleanupResult,
   type SessionManager,
   SessionNotFoundError,
+  createInitialCanonicalLifecycle,
+  createActivitySignal,
   getSessionsDir,
   getProjectBaseDir,
+  sessionFromMetadata,
 } from "@aoagents/ao-core";
 
 const {
@@ -27,6 +30,7 @@ const {
   mockGh,
   mockExec,
   mockSpawn,
+  mockIsWindows,
   mockConfigRef,
   mockSessionManager,
   sessionsDirRef,
@@ -36,6 +40,7 @@ const {
   mockGh: vi.fn(),
   mockExec: vi.fn(),
   mockSpawn: vi.fn(),
+  mockIsWindows: vi.fn().mockReturnValue(false),
   mockConfigRef: { current: null as Record<string, unknown> | null },
   mockSessionManager: {
     list: vi.fn(),
@@ -68,6 +73,16 @@ vi.mock("node:child_process", async (importOriginal) => {
   };
 });
 
+const mockNetConnect = vi.fn();
+vi.mock("node:net", async (importOriginal) => {
+  // eslint-disable-next-line @typescript-eslint/consistent-type-imports
+  const actual = await importOriginal<typeof import("node:net")>();
+  return {
+    ...actual,
+    connect: (...args: unknown[]) => mockNetConnect(...args),
+  };
+});
+
 vi.mock("../../src/lib/shell.js", () => ({
   tmux: mockTmux,
   exec: mockExec,
@@ -93,6 +108,8 @@ vi.mock("@aoagents/ao-core", async (importOriginal) => {
   return {
     ...actual,
     loadConfig: () => mockConfigRef.current,
+    isWindows: () => mockIsWindows(),
+    generateConfigHash: () => "abcdef123456",
   };
 });
 
@@ -112,34 +129,33 @@ function parseMetadata(content: string): Record<string, string> {
   return meta;
 }
 
-/** Build Session objects from metadata files in sessionsDir. */
+/**
+ * Build Session objects from metadata files in sessionsDir.
+ *
+ * Routes through the real `sessionFromMetadata()` so lifecycle reconstruction
+ * (parseCanonicalLifecycle → synthesize*State → deriveLegacyStatus) runs
+ * exactly as it does in production `sm.list()`. Tests that assert filter
+ * behavior against on-disk metadata therefore exercise the full path, not a
+ * shortcut that bypasses lifecycle synthesis.
+ */
 function buildSessionsFromDir(dir: string, projectId: string): Session[] {
   if (!existsSync(dir)) return [];
   const files = readdirSync(dir).filter((f) => !f.startsWith(".") && f !== "archive");
   return files.map((name) => {
     const content = readFileSync(join(dir, name), "utf-8");
     const meta = parseMetadata(content);
-    return {
-      id: name,
+    return sessionFromMetadata(name, meta, {
       projectId,
-      status: (meta["status"] as Session["status"]) || "spawning",
-      activity: null,
-      branch: meta["branch"] || null,
-      issueId: meta["issue"] || null,
-      pr: null,
-      workspacePath: meta["worktree"] || null,
       runtimeHandle: { id: name, runtimeName: "tmux", data: {} },
-      agentInfo: null,
-      createdAt: new Date(),
-      lastActivityAt: new Date(),
-      metadata: meta,
-    } satisfies Session;
+    });
   });
 }
 
 let tmpDir: string;
 let configPath: string;
 let sessionsDir: string;
+let originalHome: string | undefined;
+const STORAGE_KEY = "111111111112";
 
 import { Command } from "commander";
 import { registerSession } from "../../src/commands/session.js";
@@ -149,6 +165,8 @@ let consoleSpy: ReturnType<typeof vi.spyOn>;
 
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), "ao-session-test-"));
+  originalHome = process.env["HOME"];
+  process.env["HOME"] = tmpDir;
 
   configPath = join(tmpDir, "agent-orchestrator.yaml");
   writeFileSync(configPath, "projects: {}");
@@ -167,6 +185,7 @@ beforeEach(() => {
         name: "My App",
         repo: "org/my-app",
         path: join(tmpDir, "main-repo"),
+        storageKey: STORAGE_KEY,
         defaultBranch: "main",
         sessionPrefix: "app",
       },
@@ -179,7 +198,7 @@ beforeEach(() => {
   mkdirSync(join(tmpDir, "main-repo"), { recursive: true });
 
   // Calculate and create sessions directory for hash-based architecture
-  sessionsDir = getSessionsDir(configPath, join(tmpDir, "main-repo"));
+  sessionsDir = getSessionsDir(STORAGE_KEY);
   mkdirSync(sessionsDir, { recursive: true });
   sessionsDirRef.current = sessionsDir;
 
@@ -245,8 +264,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  process.env["HOME"] = originalHome;
   // Clean up hash-based directories in ~/.agent-orchestrator
-  const projectBaseDir = getProjectBaseDir(configPath, join(tmpDir, "main-repo"));
+  const projectBaseDir = getProjectBaseDir(STORAGE_KEY);
   if (existsSync(projectBaseDir)) {
     rmSync(projectBaseDir, { recursive: true, force: true });
   }
@@ -349,20 +369,42 @@ describe("session ls", () => {
     await program.parseAsync(["node", "test", "session", "ls", "--json"]);
 
     expect(consoleSpy).toHaveBeenCalledTimes(1);
-    expect(JSON.parse(String(consoleSpy.mock.calls[0][0]))).toEqual([
-      {
-        id: "app-1",
-        projectId: "my-app",
-        projectName: "My App",
-        role: "worker",
-        branch: "live-branch",
-        status: "working",
-        issueId: "INT-100",
-        pr: "https://github.com/org/repo/pull/42",
-        workspacePath: "/tmp/wt",
-        lastActivityAt: "2024-03-09T16:00:00.000Z",
-      },
-    ]);
+    expect(JSON.parse(String(consoleSpy.mock.calls[0][0]))).toEqual({
+      data: [
+        {
+          id: "app-1",
+          projectId: "my-app",
+          projectName: "My App",
+          role: "worker",
+          branch: "live-branch",
+          // "working" on disk + a pr= URL reconstructs to pr_open via the
+          // canonical lifecycle, which is what production sm.list() returns.
+          status: "pr_open",
+          issueId: "INT-100",
+          pr: "https://github.com/org/repo/pull/42",
+          workspacePath: "/tmp/wt",
+          lastActivityAt: "2024-03-09T16:00:00.000Z",
+        },
+      ],
+      meta: { hiddenTerminatedCount: 0 },
+    });
+  });
+
+  it("filters terminal sessions from JSON by default and reports hidden count", async () => {
+    writeFileSync(join(sessionsDir, "app-1"), "branch=main\nstatus=working\n");
+    writeFileSync(join(sessionsDir, "app-done"), "branch=main\nstatus=merged\nactivity=exited\n");
+
+    mockTmux.mockResolvedValue(null);
+    mockGit.mockResolvedValue(null);
+
+    await program.parseAsync(["node", "test", "session", "ls", "--json"]);
+
+    const parsed = JSON.parse(String(consoleSpy.mock.calls[0][0])) as {
+      data: Array<{ id: string }>;
+      meta: { hiddenTerminatedCount: number };
+    };
+    expect(parsed.data.map((entry) => entry.id)).toEqual(["app-1"]);
+    expect(parsed.meta.hiddenTerminatedCount).toBe(1);
   });
 
   it("marks metadata-based orchestrators correctly in JSON output", async () => {
@@ -377,29 +419,261 @@ describe("session ls", () => {
     await program.parseAsync(["node", "test", "session", "ls", "--json"]);
 
     expect(consoleSpy).toHaveBeenCalledTimes(1);
-    expect(JSON.parse(String(consoleSpy.mock.calls[0][0]))).toEqual([
-      {
-        id: "app-control",
-        projectId: "my-app",
-        projectName: "My App",
-        role: "orchestrator",
-        branch: "control",
-        status: "working",
-        issueId: null,
-        pr: null,
-        workspacePath: null,
-        lastActivityAt: null,
-      },
-    ]);
+    expect(JSON.parse(String(consoleSpy.mock.calls[0][0]))).toEqual({
+      data: [
+        {
+          id: "app-control",
+          projectId: "my-app",
+          projectName: "My App",
+          role: "orchestrator",
+          branch: "control",
+          status: "working",
+          issueId: null,
+          pr: null,
+          workspacePath: null,
+          lastActivityAt: null,
+        },
+      ],
+      meta: { hiddenTerminatedCount: 0 },
+    });
   });
 
-  it("returns an empty JSON array when there are no active sessions", async () => {
+  it("returns an empty JSON data array when there are no active sessions", async () => {
     mockTmux.mockResolvedValue(null);
 
     await program.parseAsync(["node", "test", "session", "ls", "--json"]);
 
     expect(consoleSpy).toHaveBeenCalledTimes(1);
-    expect(JSON.parse(String(consoleSpy.mock.calls[0][0]))).toEqual([]);
+    expect(JSON.parse(String(consoleSpy.mock.calls[0][0]))).toEqual({
+      data: [],
+      meta: { hiddenTerminatedCount: 0 },
+    });
+  });
+
+  it("hides terminated sessions by default and prints a footer", async () => {
+    writeFileSync(join(sessionsDir, "app-1"), "branch=feat/a\nstatus=working\n");
+    writeFileSync(join(sessionsDir, "app-2"), "branch=feat/b\nstatus=merged\n");
+    writeFileSync(join(sessionsDir, "app-3"), "branch=feat/c\nstatus=killed\n");
+
+    mockTmux.mockResolvedValue(null);
+    mockGit.mockResolvedValue(null);
+
+    await program.parseAsync(["node", "test", "session", "ls"]);
+
+    const output = consoleSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(output).toContain("app-1");
+    expect(output).not.toContain("app-2");
+    expect(output).not.toContain("app-3");
+    expect(output).toContain("2 terminated sessions hidden");
+    expect(output).toContain("--include-terminated");
+  });
+
+  it("shows terminated sessions when --include-terminated is passed", async () => {
+    writeFileSync(join(sessionsDir, "app-1"), "branch=feat/a\nstatus=working\n");
+    writeFileSync(join(sessionsDir, "app-2"), "branch=feat/b\nstatus=merged\n");
+
+    mockTmux.mockResolvedValue(null);
+    mockGit.mockResolvedValue(null);
+
+    await program.parseAsync([
+      "node",
+      "test",
+      "session",
+      "ls",
+      "--include-terminated",
+    ]);
+
+    const output = consoleSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(output).toContain("app-1");
+    expect(output).toContain("app-2");
+    expect(output).not.toContain("terminated sessions hidden");
+  });
+
+  it("reports hiddenTerminatedCount in JSON output when filtering terminal sessions", async () => {
+    writeFileSync(join(sessionsDir, "app-1"), "branch=feat/a\nstatus=working\n");
+    writeFileSync(join(sessionsDir, "app-2"), "branch=feat/b\nstatus=done\n");
+    writeFileSync(join(sessionsDir, "app-3"), "branch=feat/c\nstatus=killed\n");
+
+    mockTmux.mockResolvedValue(null);
+    mockGit.mockResolvedValue(null);
+
+    await program.parseAsync(["node", "test", "session", "ls", "--json"]);
+
+    expect(consoleSpy).toHaveBeenCalledTimes(1);
+    const parsed = JSON.parse(String(consoleSpy.mock.calls[0][0]));
+    expect(parsed.data).toHaveLength(1);
+    expect(parsed.data[0].id).toBe("app-1");
+    expect(parsed.meta.hiddenTerminatedCount).toBe(2);
+  });
+
+  it("returns hiddenTerminatedCount=0 in JSON when --include-terminated is passed", async () => {
+    writeFileSync(join(sessionsDir, "app-1"), "branch=feat/a\nstatus=working\n");
+    writeFileSync(join(sessionsDir, "app-2"), "branch=feat/b\nstatus=merged\n");
+
+    mockTmux.mockResolvedValue(null);
+    mockGit.mockResolvedValue(null);
+
+    await program.parseAsync([
+      "node",
+      "test",
+      "session",
+      "ls",
+      "--json",
+      "--include-terminated",
+    ]);
+
+    expect(consoleSpy).toHaveBeenCalledTimes(1);
+    const parsed = JSON.parse(String(consoleSpy.mock.calls[0][0]));
+    expect(parsed.data).toHaveLength(2);
+    expect(parsed.meta.hiddenTerminatedCount).toBe(0);
+  });
+
+  it("hides legacy on-disk metadata with status=merged even when pr= URL is absent", async () => {
+    // Regression test for the reviewer's smoke-test case on PR #1340: a metadata
+    // file with `status=merged` but no `pr=` was still showing as active because
+    // lifecycle reconstruction (synthesizePRState) collapsed pr.state to "none"
+    // when the URL was missing, which made isTerminalSession() return false.
+    writeFileSync(join(sessionsDir, "app-1"), "branch=feat/a\nstatus=working\n");
+    writeFileSync(join(sessionsDir, "app-2"), "branch=feat/b\nstatus=merged\n"); // no pr=
+    writeFileSync(join(sessionsDir, "app-3"), "branch=feat/c\nstatus=done\n");
+
+    mockTmux.mockResolvedValue(null);
+    mockGit.mockResolvedValue(null);
+
+    await program.parseAsync(["node", "test", "session", "ls", "--json"]);
+
+    expect(consoleSpy).toHaveBeenCalledTimes(1);
+    const parsed = JSON.parse(String(consoleSpy.mock.calls[0][0]));
+    expect(parsed.data.map((e: { id: string }) => e.id)).toEqual(["app-1"]);
+    expect(parsed.meta.hiddenTerminatedCount).toBe(2);
+  });
+
+  it("filters lifecycle-driven terminal sessions (runtime exited, pr merged, session terminated)", async () => {
+    // Seed three sessions whose legacy status is non-terminal ("working"), but
+    // whose canonical lifecycle marks them as terminal in three distinct ways.
+    // This exercises the lifecycle branch of isTerminalSession (types.ts:250),
+    // which short-circuits before TERMINAL_STATUSES is consulted.
+    const makeLifecycleSession = (
+      id: string,
+      mutate: (lc: ReturnType<typeof createInitialCanonicalLifecycle>) => void,
+    ): Session => {
+      const lifecycle = createInitialCanonicalLifecycle("worker", new Date());
+      lifecycle.session.state = "working";
+      lifecycle.session.reason = "task_in_progress";
+      lifecycle.runtime.state = "alive";
+      lifecycle.runtime.reason = "process_running";
+      mutate(lifecycle);
+      return {
+        id,
+        projectId: "my-app",
+        status: "working",
+        activity: null,
+        activitySignal: createActivitySignal("unavailable"),
+        lifecycle,
+        branch: null,
+        issueId: null,
+        pr: null,
+        workspacePath: null,
+        runtimeHandle: null,
+        agentInfo: null,
+        createdAt: new Date(),
+        lastActivityAt: new Date(),
+        metadata: {},
+      } satisfies Session;
+    };
+
+    mockSessionManager.list.mockResolvedValue([
+      makeLifecycleSession("app-1", () => {
+        // alive — should remain visible
+      }),
+      makeLifecycleSession("app-2", (lc) => {
+        lc.runtime.state = "exited";
+        lc.runtime.reason = "process_not_running";
+      }),
+      makeLifecycleSession("app-3", (lc) => {
+        lc.pr.state = "merged";
+        lc.pr.reason = "merged_by_user";
+      }),
+      makeLifecycleSession("app-4", (lc) => {
+        lc.session.state = "terminated";
+        lc.session.reason = "manually_killed";
+      }),
+    ]);
+
+    mockTmux.mockResolvedValue(null);
+    mockGit.mockResolvedValue(null);
+
+    await program.parseAsync(["node", "test", "session", "ls", "--json"]);
+
+    expect(consoleSpy).toHaveBeenCalledTimes(1);
+    const parsed = JSON.parse(String(consoleSpy.mock.calls[0][0]));
+    expect(parsed.data.map((e: { id: string }) => e.id)).toEqual(["app-1"]);
+    expect(parsed.meta.hiddenTerminatedCount).toBe(3);
+  });
+
+  it("hides terminal-status sessions by default", async () => {
+    writeFileSync(join(sessionsDir, "app-1"), "branch=main\nstatus=working\n");
+    writeFileSync(join(sessionsDir, "app-done"), "branch=main\nstatus=merged\n");
+
+    mockTmux.mockImplementation(async (...args: string[]) => {
+      if (args[0] === "list-sessions") return "app-1\napp-done";
+      if (args[0] === "display-message") {
+        return String(Math.floor(Date.now() / 1000) - 60);
+      }
+      return null;
+    });
+    mockGit.mockResolvedValue(null);
+
+    await program.parseAsync(["node", "test", "session", "ls"]);
+
+    const output = consoleSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(output).toContain("app-1");
+    expect(output).not.toContain("app-done");
+  });
+
+  it("lists terminal sessions when --include-terminated is set", async () => {
+    writeFileSync(join(sessionsDir, "app-done"), "branch=main\nstatus=merged\n");
+
+    mockTmux.mockImplementation(async (...args: string[]) => {
+      if (args[0] === "list-sessions") return "app-done";
+      return null;
+    });
+    mockGit.mockResolvedValue(null);
+
+    await program.parseAsync(["node", "test", "session", "ls", "--include-terminated"]);
+
+    const output = consoleSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(output).toContain("app-done");
+  });
+
+  it("prints a hint when only terminal sessions exist", async () => {
+    writeFileSync(join(sessionsDir, "app-done"), "branch=main\nstatus=merged\n");
+
+    mockTmux.mockImplementation(async (...args: string[]) => {
+      if (args[0] === "list-sessions") return "app-done";
+      return null;
+    });
+
+    await program.parseAsync(["node", "test", "session", "ls"]);
+
+    const output = consoleSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(output).toContain("--include-terminated");
+    expect(output).not.toContain("app-done");
+  });
+
+  it("prints a hint when terminal sessions are hidden alongside active ones", async () => {
+    writeFileSync(join(sessionsDir, "app-1"), "branch=main\nstatus=working\n");
+    writeFileSync(join(sessionsDir, "app-done"), "branch=main\nstatus=merged\n");
+
+    mockTmux.mockResolvedValue(null);
+    mockGit.mockResolvedValue(null);
+
+    await program.parseAsync(["node", "test", "session", "ls"]);
+
+    const output = consoleSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(output).toContain("app-1");
+    expect(output).toContain("terminated session");
+    expect(output).toContain("--include-terminated");
   });
 });
 
@@ -475,12 +749,214 @@ describe("session attach", () => {
   });
 
   it("fails when tmux session does not exist", async () => {
+    mockIsWindows.mockReturnValue(false);
     mockSessionManager.get.mockResolvedValue(null);
     mockTmux.mockResolvedValue(null);
 
     await expect(
       program.parseAsync(["node", "test", "session", "attach", "unknown-1"]),
     ).rejects.toThrow("process.exit(1)");
+  });
+
+  it("connects to named pipe on Windows", async () => {
+    mockIsWindows.mockReturnValue(true);
+    mockSessionManager.get.mockResolvedValue({
+      id: "app-1",
+      projectId: "my-app",
+      status: "working",
+      activity: null,
+      branch: null,
+      issueId: null,
+      pr: null,
+      workspacePath: null,
+      runtimeHandle: { id: "hash-app-1", runtimeName: "process", data: { pipePath: "\\\\.\\pipe\\ao-pty-hash-app-1" } },
+      agentInfo: null,
+      createdAt: new Date(),
+      lastActivityAt: new Date(),
+      metadata: {},
+    } satisfies Session);
+
+    const mockSocket = new EventEmitter();
+    Object.assign(mockSocket, { destroy: vi.fn(), write: vi.fn() });
+    mockNetConnect.mockReturnValue(mockSocket);
+
+    // Fire the command — it awaits an infinite promise, so don't await it.
+    // The process.exit mock throws, which surfaces synchronously through emit().
+    void program.parseAsync(["node", "test", "session", "attach", "app-1"]);
+
+    await new Promise((r) => setTimeout(r, 10));
+    mockSocket.emit("connect");
+    await new Promise((r) => setTimeout(r, 10));
+
+    // Exercise binary protocol: send terminal data (0x01)
+    const termData = Buffer.from("hello");
+    const dataFrame = Buffer.alloc(5 + termData.length);
+    dataFrame.writeUInt8(0x01, 0);
+    dataFrame.writeUInt32BE(termData.length, 1);
+    termData.copy(dataFrame, 5);
+    const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    mockSocket.emit("data", dataFrame);
+    expect(writeSpy).toHaveBeenCalledWith(termData);
+    writeSpy.mockRestore();
+
+    // Exercise stdin relay: send input data (becomes MSG_TERMINAL_INPUT = 0x02)
+    const inputData = Buffer.from("ls\r");
+    process.stdin.emit("data", inputData);
+    expect((mockSocket as { write: ReturnType<typeof vi.fn> }).write).toHaveBeenCalled();
+    const written = (mockSocket as { write: ReturnType<typeof vi.fn> }).write.mock.calls.at(-1)![0] as Buffer;
+    expect(written.readUInt8(0)).toBe(0x02); // MSG_TERMINAL_INPUT
+    expect(written.subarray(5).toString()).toBe("ls\r");
+
+    // close handler calls process.exit(0) which throws synchronously through emit
+    expect(() => mockSocket.emit("close")).toThrow("process.exit(0)");
+    expect(mockNetConnect).toHaveBeenCalledWith("\\\\.\\pipe\\ao-pty-hash-app-1");
+    // Remove stdin listeners to prevent cross-test contamination
+    process.stdin.removeAllListeners("data");
+    mockIsWindows.mockReturnValue(false);
+  });
+
+  it("handles PTY exit status on Windows", async () => {
+    mockIsWindows.mockReturnValue(true);
+    mockSessionManager.get.mockResolvedValue({
+      id: "app-1",
+      projectId: "my-app",
+      status: "working",
+      activity: null,
+      branch: null,
+      issueId: null,
+      pr: null,
+      workspacePath: null,
+      runtimeHandle: { id: "hash-app-1", runtimeName: "process", data: {} },
+      agentInfo: null,
+      createdAt: new Date(),
+      lastActivityAt: new Date(),
+      metadata: {},
+    } satisfies Session);
+
+    const mockSocket = new EventEmitter();
+    Object.assign(mockSocket, { destroy: vi.fn(), write: vi.fn() });
+    mockNetConnect.mockReturnValue(mockSocket);
+
+    void program.parseAsync(["node", "test", "session", "attach", "app-1"]);
+
+    await new Promise((r) => setTimeout(r, 10));
+    mockSocket.emit("connect");
+    await new Promise((r) => setTimeout(r, 10));
+
+    // Exercise PTY exit status (MSG_STATUS_RES = 0x07, alive=false)
+    // process.exit is inside try/catch in the data handler, so the mock throw
+    // gets swallowed. Verify via side effects instead.
+    const statusPayload = Buffer.from(JSON.stringify({ alive: false, exitCode: 42 }));
+    const statusFrame = Buffer.alloc(5 + statusPayload.length);
+    statusFrame.writeUInt8(0x07, 0);
+    statusFrame.writeUInt32BE(statusPayload.length, 1);
+    statusPayload.copy(statusFrame, 5);
+    mockSocket.emit("data", statusFrame);
+
+    // cleanup() was called (socket destroyed)
+    expect((mockSocket as { destroy: ReturnType<typeof vi.fn> }).destroy).toHaveBeenCalled();
+    // process.exit was called with the exit code from the status message
+    expect(process.exit).toHaveBeenCalledWith(42);
+
+    mockIsWindows.mockReturnValue(false);
+  });
+
+  it("detaches on Ctrl+backslash on Windows", async () => {
+    mockIsWindows.mockReturnValue(true);
+    mockSessionManager.get.mockResolvedValue({
+      id: "app-1",
+      projectId: "my-app",
+      status: "working",
+      activity: null,
+      branch: null,
+      issueId: null,
+      pr: null,
+      workspacePath: null,
+      runtimeHandle: { id: "hash-app-1", runtimeName: "process", data: {} },
+      agentInfo: null,
+      createdAt: new Date(),
+      lastActivityAt: new Date(),
+      metadata: {},
+    } satisfies Session);
+
+    const mockSocket = new EventEmitter();
+    Object.assign(mockSocket, { destroy: vi.fn(), write: vi.fn() });
+    mockNetConnect.mockReturnValue(mockSocket);
+
+    // Temporarily replace process.exit with a non-throwing spy so it doesn't
+    // propagate through EventEmitter and prevent subsequent listener calls.
+    // The global beforeEach spy throws, which breaks emit() propagation for
+    // listeners registered on process.stdin (a shared singleton).
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+
+    void program.parseAsync(["node", "test", "session", "attach", "app-1"]);
+
+    await new Promise((r) => setTimeout(r, 10));
+    mockSocket.emit("connect");
+    await new Promise((r) => setTimeout(r, 10));
+
+    // Ctrl+\ (0x1c) triggers detach
+    process.stdin.emit("data", Buffer.from([0x1c]));
+
+    expect((mockSocket as { destroy: ReturnType<typeof vi.fn> }).destroy).toHaveBeenCalled();
+    expect(exitSpy).toHaveBeenCalledWith(0);
+    exitSpy.mockRestore();
+
+    // Remove the stdin listener we attached to prevent cross-test contamination
+    process.stdin.removeAllListeners("data");
+    mockIsWindows.mockReturnValue(false);
+  });
+
+  it("falls back to config hash when runtimeHandle is missing on Windows", async () => {
+    mockIsWindows.mockReturnValue(true);
+    mockSessionManager.get.mockResolvedValue(null);
+
+    const mockSocket = new EventEmitter();
+    Object.assign(mockSocket, { destroy: vi.fn() });
+    mockNetConnect.mockReturnValue(mockSocket);
+
+    void program.parseAsync(["node", "test", "session", "attach", "app-1"]);
+
+    await new Promise((r) => setTimeout(r, 10));
+    // Should use config hash fallback for pipe path
+    expect(mockNetConnect).toHaveBeenCalled();
+    const pipePath = mockNetConnect.mock.calls[0][0] as string;
+    expect(pipePath).toMatch(/\\\\\.\\pipe\\ao-pty-/);
+
+    // Clean up: trigger error to exit
+    expect(() => mockSocket.emit("error", new Error("ENOENT"))).toThrow("process.exit(1)");
+    mockIsWindows.mockReturnValue(false);
+  });
+
+  it("shows error when pipe not available on Windows", async () => {
+    mockIsWindows.mockReturnValue(true);
+    mockSessionManager.get.mockResolvedValue({
+      id: "app-1",
+      projectId: "my-app",
+      status: "working",
+      activity: null,
+      branch: null,
+      issueId: null,
+      pr: null,
+      workspacePath: null,
+      runtimeHandle: { id: "hash-app-1", runtimeName: "process", data: { pipePath: "\\\\.\\pipe\\ao-pty-hash-app-1" } },
+      agentInfo: null,
+      createdAt: new Date(),
+      lastActivityAt: new Date(),
+      metadata: {},
+    } satisfies Session);
+
+    const mockSocket = new EventEmitter();
+    Object.assign(mockSocket, { destroy: vi.fn() });
+    mockNetConnect.mockReturnValue(mockSocket);
+
+    // Fire the command — it awaits an infinite promise, so don't await it.
+    void program.parseAsync(["node", "test", "session", "attach", "app-1"]);
+
+    await new Promise((r) => setTimeout(r, 10));
+    // error handler calls process.exit(1) which throws synchronously through emit
+    expect(() => mockSocket.emit("error", new Error("connect ENOENT"))).toThrow("process.exit(1)");
+    mockIsWindows.mockReturnValue(false);
   });
 });
 

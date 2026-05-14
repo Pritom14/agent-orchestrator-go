@@ -96,6 +96,13 @@ Every abstraction is a pluggable interface defined in `packages/core/src/types.t
 
 ### Session Lifecycle
 
+Sessions have a **canonical lifecycle** (in `lifecycle-state.ts`) with separate `state` and `reason` fields, and a **legacy status** derived from them for display.
+
+**Canonical session states:** `not_started`, `working`, `idle`, `needs_input`, `stuck`, `detecting`, `done`, `terminated`
+
+**Terminal reasons:** `manually_killed`, `runtime_lost`, `agent_process_exited`, `probe_failure`, `error_in_process`, `auto_cleanup`, `pr_merged`
+
+**Legacy status flow (derived via `deriveLegacyStatus`):**
 ```
 spawning -> working -> pr_open -> ci_failed / review_pending
                                       |              |
@@ -103,6 +110,8 @@ spawning -> working -> pr_open -> ci_failed / review_pending
                                       |              |
                                       +-> mergeable -> merged -> cleanup -> done
 ```
+
+**Stale runtime reconciliation:** `sm.list()` detects dead runtimes (tmux/process gone) during enrichment and persists `runtime_lost` reason to disk. This maps to legacy status `killed`. Without this, sessions with dead runtimes would show stale "active" status indefinitely.
 
 ### Data Flow
 
@@ -119,17 +128,160 @@ agent-orchestrator.yaml -> Config Loader (Zod) -> Plugin Registry
 No database. Flat files + memory:
 
 - **Config:** `agent-orchestrator.yaml` (Zod-validated)
+- **Global config:** `~/.agent-orchestrator/config.yaml` (all registered projects)
 - **Session metadata:** `~/.agent-orchestrator/{hash}-{projectId}/sessions/{sessionId}` (key-value pairs)
 - **Worktrees:** `~/.agent-orchestrator/{hash}-{projectId}/worktrees/{sessionId}/`
 - **Archives:** `~/.agent-orchestrator/{hash}-{projectId}/archive/{sessionId}_{timestamp}`
+- **Running state:** `~/.agent-orchestrator/running.json` (current ao start PID, port, projects)
+- **Last-stop state:** `~/.agent-orchestrator/last-stop.json` (sessions killed by ao stop / Ctrl+C, includes `otherProjects` for cross-project sessions — used by ao start to offer session restore)
 
 Hash = SHA-256 of config directory (first 12 chars). Prevents collision across multiple checkouts.
+
+**Config resolution:** `loadConfig()` searches up from cwd and finds the nearest `agent-orchestrator.yaml` (typically 1 project). The global config at `~/.agent-orchestrator/config.yaml` contains all registered projects. CLI commands that need cross-project visibility (ao stop, tab completions) fall back to the global config.
 
 ### Prompt Assembly (3 Layers)
 
 1. Base prompt (system instructions in core)
 2. Config prompt (project-specific rules from YAML)
 3. Rules files (optional `.agent-rules.md` from repo)
+
+## Working Principles
+
+These behavioral guidelines apply to every agent working on this codebase. They are not optional - they prevent the most common causes of PR rejection and rewrite.
+
+### Think Before Coding
+
+Don't assume. Don't hide confusion. Surface tradeoffs.
+
+- State assumptions explicitly. If uncertain, ask.
+- If multiple interpretations of a task exist, present them - don't pick silently.
+- If a simpler approach exists, say so. Push back when warranted.
+- If something is unclear, stop. Name what's confusing. Ask.
+- When editing `lifecycle-manager.ts` or `session-manager.ts`: state which invariants your change preserves. These files have subtle state dependencies.
+
+### Simplicity First
+
+Minimum code that solves the problem. Nothing speculative.
+
+- No features beyond what was asked.
+- No abstractions for single-use code.
+- No "flexibility" or "configurability" that wasn't requested.
+- No error handling for impossible scenarios.
+- Plugin slots are the extension point. Don't add configuration surface when a new plugin is the right answer.
+- If you write 200 lines and it could be 50, rewrite it.
+
+Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
+
+### Surgical Changes
+
+Touch only what you must. Clean up only your own mess.
+
+- Don't "improve" adjacent code, comments, or formatting.
+- Don't refactor things that aren't broken.
+- Match existing style, even if you'd do it differently.
+- If your changes create orphans (unused imports, dead variables), remove them.
+- Don't remove pre-existing dead code unless asked.
+- Every changed line should trace directly to the task description.
+
+This is especially critical in:
+- `types.ts` - changing an interface breaks every plugin. Minimize surface changes.
+- `globals.css` - tokens are consumed across 50+ components. Don't rename casually.
+- `lifecycle-manager.ts` - state transitions have implicit dependencies. Document why a transition is safe.
+
+### Goal-Driven Execution
+
+Define success criteria. Loop until verified.
+
+Transform tasks into verifiable goals:
+- "Add a new status" -> "Add to enum, update `isTerminalSession`, add to dashboard column mapping, write tests for all three"
+- "Fix the bug" -> "Write a test that reproduces it, then make it pass"
+- "Refactor X" -> "Ensure tests pass before and after"
+
+For multi-step tasks, state a brief plan:
+
+[Step] -> verify: [check]
+[Step] -> verify: [check]
+[Step] -> verify: [check]
+
+Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
+
+## CLI Behavior (ao start / ao stop)
+
+### ao start
+- Registers in `running.json` (PID, port, projects)
+- Offers to restore sessions from `last-stop.json` — includes cross-project sessions via `otherProjects` field
+- **Ctrl+C performs full graceful shutdown** (same as ao stop): kills all sessions, writes last-stop state, unregisters from running.json. 10s hard timeout guarantees exit.
+
+### ao stop
+- `ao stop` (no args): kills ALL sessions across ALL projects, sends SIGTERM to parent ao start process, stops dashboard, unregisters
+- `ao stop <project>`: kills only that project's sessions, does NOT kill parent process or dashboard (they serve all projects)
+- Always loads global config (`~/.agent-orchestrator/config.yaml`) to see all projects — local config only has the cwd project
+- Records `LastStopState` with `otherProjects` field for cross-project session restore
+
+### Dashboard sidebar
+- Sidebar always shows sessions from ALL projects regardless of which project page is active
+- `useSessionEvents` in Dashboard.tsx is called without project filter — sidebar gets unscoped sessions
+- Kanban board filters client-side via `projectSessions` memo
+
+### Key invariants
+- `sm.list()` persists `runtime_lost` lifecycle to disk when enrichment detects dead runtimes — this is the only place stale runtime state gets reconciled
+- `deriveLegacyStatus()` maps canonical lifecycle to legacy status — new terminal reasons must be added here
+- Tab completions merge local config + global config to show all projects
+
+## Cross-Platform (Windows) Compatibility
+
+AO ships on macOS, Linux, **and Windows**. All three are first-class.
+
+### The Golden Rule
+
+> **Never write `process.platform === "win32"` in new code. Use `isWindows()` from `@aoagents/ao-core`. If you need branching the helpers don't cover, add it to `packages/core/src/platform.ts` (or one of the targeted helper modules below) — never inline at the call site.**
+
+The codebase has a deliberate set of cross-platform abstractions. Every platform helper is centrally tested by mocking `process.platform`; inline checks bypass those tests and become silent regressions. Whenever you'd type `process.platform`, stop and check the helper inventory in `docs/CROSS_PLATFORM.md` first.
+
+### Read `docs/CROSS_PLATFORM.md` before merging if you touch any of:
+
+- Process spawning, killing, signalling, or process-tree teardown (`child_process`, `process.kill`, runtime plugins)
+- File paths — comparison, joining, walking, anything OS-specific
+- Shell commands (`exec`, `execFile`, command strings, redirections, PowerShell-vs-bash)
+- Network binding, sockets, anything that says `localhost`
+- Shell-outs to POSIX tools (`tmux`, `lsof`, `pkill`, `which`, coreutils)
+- Adding any new `if (process.platform === "win32")` check (it should go into `platform.ts` instead — see the Golden Rule)
+- Runtime / agent / workspace plugin code that runs on both `runtime-tmux` and `runtime-process`
+- Agent-plugin internals: `setupPathWrapperWorkspace`, `getActivityState`, `formatLaunchCommand`, `isProcessRunning`, `detect()`
+- The Windows pty-host pipe protocol or registry (`pty-client.ts`, `windows-pty-registry.ts`, `sweepWindowsPtyHosts`)
+
+### Quick reference: helpers to use instead of raw platform checks
+
+All importable from `@aoagents/ao-core` unless noted:
+
+| Need | Use |
+|------|-----|
+| OS check | `isWindows()` |
+| Pick runtime | `getDefaultRuntime()` |
+| Resolve shell (PowerShell vs `/bin/sh`) | `getShell()` |
+| Kill process + descendants | `killProcessTree(pid, signal?)` |
+| Find PID listening on a port | `findPidByPort(port)` |
+| Default env (HOME / TMPDIR / SHELL / PATH / USER) | `getEnvDefaults()` |
+| Compare paths (case-insensitive on NTFS/APFS) | `pathsEqual()` / `canonicalCompareKey()` from `cli/src/lib/path-equality.ts` |
+| Escape shell args | `shellEscape()` |
+| Install agent PATH wrappers (`gh`/`git`) | `setupPathWrapperWorkspace(workspacePath)` |
+| Build env PATH with `~/.ao/bin` prepended | `buildAgentPath(basePath?)` |
+| Tail JSONL | `readLastJsonlEntry` / `readLastActivityEntry` |
+| Activity-state contract helpers | `checkActivityLogState`, `getActivityFallbackState`, `classifyTerminalActivity`, `recordTerminalActivity`, `appendActivityEntry` |
+| Windows pty-host registry (used by `ao stop`) | `registerWindowsPtyHost`, `getWindowsPtyHosts`, `unregisterWindowsPtyHost`, `clearWindowsPtyHostRegistry` |
+| Reap orphan pty-hosts on `ao stop` | `sweepWindowsPtyHosts()` from `@aoagents/ao-plugin-runtime-process` |
+| Talk to a Windows pty-host over its named pipe | `getPipePath`, `connectPtyHost`, `ptyHostSendMessage`, `ptyHostGetOutput`, `ptyHostIsAlive`, `ptyHostKill` from `@aoagents/ao-plugin-runtime-process` |
+| Validate user-supplied session ID before pipe/shell use | `validateSessionId()` from `@/server/tmux-utils` |
+| Resolve a session's Windows pipe path | `resolvePipePath()` from `@/server/tmux-utils` |
+| POSIX-only Ctrl+C signal forwarding | `forwardSignalsToChild()` from `cli/src/lib/shell.ts` (guard with `!isWindows()`) |
+| Defensive PowerShell sweep of orphan pty-hosts | `stopStaleWindowsPtyHosts(projectDir)` from `web/src/lib/windows-pty-cleanup.ts` |
+
+`docs/CROSS_PLATFORM.md` has the full helper reference with import paths, the EPERM-vs-ESRCH gotcha when probing processes (with a copyable code snippet), path case-insensitivity rules, PowerShell-vs-bash differences (`& ` call-operator, `$env:VAR`, no `/dev/null`, no `$(cat …)`, `.cmd`/`.bat`/`.exe` shim resolution via `shell: isWindows()`), the IPv6 `localhost` stall on Windows, agent-plugin Windows specifics, the test pattern for mocking `process.platform`, and a 10-point pre-merge checklist. **Run through that checklist for any non-trivial change.**
+
+### Environment variables to know about
+
+- `AO_SHELL` — overrides `getShell()` resolution (escape hatch for Git Bash users on Windows). Args inferred from basename: `cmd` → `/c`, `bash`/`sh`/`zsh` → `-c`, anything else → `-Command`.
+- `AO_BASH_PATH` — used by `script-runner.ts` on Windows to locate bash before falling back to Git Bash auto-detection. WSL bash is excluded (it sees Linux paths from a Windows cwd, breaking script semantics).
 
 ## Conventions
 
@@ -190,8 +342,9 @@ Hash = SHA-256 of config directory (first 12 chars). Prevents collision across m
 | File | Purpose |
 |------|---------|
 | `packages/core/src/types.ts` | Central type definitions (all 8 plugin interfaces) |
-| `packages/core/src/session-manager.ts` | Session CRUD operations |
+| `packages/core/src/session-manager.ts` | Session CRUD + stale runtime reconciliation (persists runtime_lost on dead runtimes) |
 | `packages/core/src/lifecycle-manager.ts` | State machine + polling loop + reactions |
+| `packages/core/src/lifecycle-state.ts` | Canonical lifecycle → legacy status mapping (deriveLegacyStatus) |
 | `packages/core/src/config.ts` | YAML config loading with Zod validation |
 | `packages/core/src/plugin-registry.ts` | Plugin discovery and resolution |
 | `packages/core/src/index.ts` | Core public API (stable, do not break) |
@@ -199,13 +352,29 @@ Hash = SHA-256 of config directory (first 12 chars). Prevents collision across m
 | `packages/web/src/components/SessionDetail.tsx` | Session detail view |
 | `packages/web/src/components/DirectTerminal.tsx` | xterm.js terminal with WebSocket |
 | `packages/web/src/components/SessionCard.tsx` | Kanban session card |
-| `packages/web/src/hooks/useSessionEvents.ts` | SSE consumer hook |
+| `packages/web/src/hooks/useSessionEvents.ts` | SSE consumer hook (project filter optional — sidebar uses unscoped) |
 | `packages/web/src/lib/types.ts` | Dashboard types |
 | `packages/web/src/app/globals.css` | Design tokens and base styles (full token definitions) |
 | `DESIGN.md` | **Design system reference** — design principles, token mapping, component patterns, anti-patterns (read this before writing any web UI) |
 | `agent-orchestrator.yaml` | Project-level config (user-created) |
 | `eslint.config.js` | ESLint flat config |
 | `tsconfig.base.json` | Shared TypeScript base config |
+| `packages/cli/src/commands/start.ts` | ao start/stop commands + Ctrl+C graceful shutdown |
+| `packages/cli/src/lib/running-state.ts` | RunningState + LastStopState management (register/unregister, last-stop read/write) |
+| `packages/web/src/components/ProjectSidebar.tsx` | Sidebar — always shows all projects' sessions |
+
+## Skills
+
+The `skills/` directory contains reusable workflow documents for common tasks. Load them before starting work:
+
+| Skill | When to load |
+|-------|-------------|
+| [`skills/bug-triage/SKILL.md`](skills/bug-triage/SKILL.md) | Triage a bug report — investigate, search duplicates, file GitHub issues, push fix PRs |
+| [`skills/agent-orchestrator/SKILL.md`](skills/agent-orchestrator/SKILL.md) | Architecture and conventions for working on this codebase |
+| [`skills/release-notes/ao-weekly-release/SKILL.md`](skills/release-notes/ao-weekly-release/SKILL.md) | Generate weekly release notes from git history |
+| [`skills/social-media/SKILL.md`](skills/social-media/SKILL.md) | Social media post generation |
+
+See [`skills/README.md`](skills/README.md) for how to install skills into other coding agents (Cursor, Copilot, Codex, etc.).
 
 ## Plugin Standards
 

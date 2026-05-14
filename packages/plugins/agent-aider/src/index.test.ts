@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import type { Session, RuntimeHandle, AgentLaunchConfig } from "@aoagents/ao-core";
+import { createActivitySignal, type Session, type RuntimeHandle, type AgentLaunchConfig } from "@aoagents/ao-core";
 
 // Mock fs/promises for getSessionInfo tests (readFile for .aider.chat.history.md)
 vi.mock("node:fs/promises", async (importOriginal) => {
@@ -11,12 +11,19 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 });
 
 // Mock activity log utilities from core
-const { mockAppendActivityEntry, mockReadLastActivityEntry, mockRecordTerminalActivity } =
-  vi.hoisted(() => ({
-    mockAppendActivityEntry: vi.fn().mockResolvedValue(undefined),
-    mockReadLastActivityEntry: vi.fn().mockResolvedValue(null),
-    mockRecordTerminalActivity: vi.fn().mockResolvedValue(undefined),
-  }));
+const {
+  mockAppendActivityEntry,
+  mockReadLastActivityEntry,
+  mockRecordTerminalActivity,
+  mockIsWindows,
+  mockReadFileSync,
+} = vi.hoisted(() => ({
+  mockAppendActivityEntry: vi.fn().mockResolvedValue(undefined),
+  mockReadLastActivityEntry: vi.fn().mockResolvedValue(null),
+  mockRecordTerminalActivity: vi.fn().mockResolvedValue(undefined),
+  mockIsWindows: vi.fn(() => false),
+  mockReadFileSync: vi.fn(() => ""),
+}));
 
 vi.mock("@aoagents/ao-core", async (importOriginal) => {
   const actual = (await importOriginal()) as Record<string, unknown>;
@@ -25,7 +32,13 @@ vi.mock("@aoagents/ao-core", async (importOriginal) => {
     appendActivityEntry: mockAppendActivityEntry,
     readLastActivityEntry: mockReadLastActivityEntry,
     recordTerminalActivity: mockRecordTerminalActivity,
+    isWindows: mockIsWindows,
   };
+});
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = (await importOriginal()) as Record<string, unknown>;
+  return { ...actual, readFileSync: mockReadFileSync };
 });
 
 // ---------------------------------------------------------------------------
@@ -53,6 +66,11 @@ function makeSession(overrides: Partial<Session> = {}): Session {
     projectId: "test-project",
     status: "working",
     activity: "active",
+    activitySignal: createActivitySignal("valid", {
+      activity: "active",
+      timestamp: new Date(),
+      source: "native",
+    }),
     branch: "feat/test",
     issueId: null,
     pr: null,
@@ -176,9 +194,13 @@ describe("getLaunchCommand", () => {
     expect(cmd).toBe("aider --yes --model 'sonnet' --message 'Go'");
   });
 
-  it("escapes single quotes in prompt (POSIX shell escaping)", () => {
+  it("escapes single quotes in prompt", () => {
     const cmd = agent.getLaunchCommand(makeLaunchConfig({ prompt: "it's broken" }));
-    expect(cmd).toContain("--message 'it'\\''s broken'");
+    if (process.platform === "win32") {
+      expect(cmd).toContain("--message 'it''s broken'");
+    } else {
+      expect(cmd).toContain("--message 'it'\\''s broken'");
+    }
   });
 
   it("omits optional flags when not provided", () => {
@@ -186,6 +208,15 @@ describe("getLaunchCommand", () => {
     expect(cmd).not.toContain("--yes");
     expect(cmd).not.toContain("--model");
     expect(cmd).not.toContain("--message");
+  });
+
+  it("inlines systemPromptFile content on Windows instead of $(cat ...)", () => {
+    mockIsWindows.mockReturnValueOnce(true);
+    mockReadFileSync.mockReturnValueOnce("You are a senior engineer.");
+    const cmd = agent.getLaunchCommand(makeLaunchConfig({ systemPromptFile: "C:\\prompts\\sys.md" }));
+    expect(cmd).toContain("--system-prompt");
+    expect(cmd).toContain("You are a senior engineer.");
+    expect(cmd).not.toContain("$(cat");
   });
 });
 
@@ -276,6 +307,39 @@ describe("isProcessRunning", () => {
       return Promise.reject(new Error("unexpected"));
     });
     expect(await agent.isProcessRunning(makeTmuxHandle())).toBe(true);
+  });
+
+  it("returns false for tmux handle on Windows without spawning ps", async () => {
+    mockIsWindows.mockReturnValue(true);
+    mockExecFileAsync.mockRejectedValue(new Error("ps not available on Windows"));
+    expect(await agent.isProcessRunning(makeTmuxHandle())).toBe(false);
+    expect(mockExecFileAsync).not.toHaveBeenCalledWith("ps", expect.anything(), expect.anything());
+    mockIsWindows.mockReturnValue(false);
+  });
+});
+
+describe("isProcessRunning with process runtime", () => {
+  it("returns true for a live PID", async () => {
+    const handle = {
+      id: "test-session",
+      runtimeName: "process",
+      data: { pid: process.pid }, // current process — known alive
+    };
+    const agent = create();
+    const result = await agent.isProcessRunning(handle as unknown as RuntimeHandle);
+    expect(result).toBe(true);
+  });
+
+  it("returns false for a dead PID", async () => {
+    const killSpy = vi.spyOn(process, "kill").mockImplementationOnce(() => {
+      const err = Object.assign(new Error("ESRCH"), { code: "ESRCH" });
+      throw err;
+    });
+    const handle = { id: "test", runtimeName: "process", data: { pid: 999999 } };
+    const agent = create();
+    const result = await agent.isProcessRunning(handle as any);
+    expect(result).toBe(false);
+    killSpy.mockRestore();
   });
 });
 
@@ -408,14 +472,14 @@ describe("postLaunchSetup", () => {
 describe("getEnvironment PATH", () => {
   const agent = create();
 
-  it("prepends ~/.ao/bin to PATH", () => {
+  it("does not set PATH (injected by session-manager)", () => {
     const env = agent.getEnvironment(makeLaunchConfig());
-    expect(env["PATH"]).toMatch(/\.ao\/bin/);
+    expect(env["PATH"]).toBeUndefined();
   });
 
-  it("sets GH_PATH", () => {
+  it("does not set GH_PATH (injected by session-manager)", () => {
     const env = agent.getEnvironment(makeLaunchConfig());
-    expect(env["GH_PATH"]).toBe("/usr/local/bin/gh");
+    expect(env["GH_PATH"]).toBeUndefined();
   });
 });
 

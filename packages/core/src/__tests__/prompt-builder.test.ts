@@ -3,7 +3,11 @@ import { mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
-import { buildPrompt, BASE_AGENT_PROMPT } from "../prompt-builder.js";
+import {
+  buildPrompt,
+  BASE_AGENT_PROMPT,
+  BASE_AGENT_PROMPT_NO_REPO,
+} from "../prompt-builder.js";
 import type { ProjectConfig } from "../types.js";
 
 let tmpDir: string;
@@ -26,66 +30,171 @@ afterEach(() => {
   rmSync(tmpDir, { recursive: true, force: true });
 });
 
-describe("buildPrompt", () => {
-  it("includes base prompt on bare spawns", () => {
-    const result = buildPrompt({ project, projectId: "test-app" });
-    expect(result).toContain(BASE_AGENT_PROMPT);
-    expect(result).toContain("## Project Context");
-    expect(result).toContain("Project: Test App");
+function combinePrompt({
+  systemPrompt,
+  taskPrompt,
+}: {
+  systemPrompt: string;
+  taskPrompt?: string;
+}): string {
+  return taskPrompt ? `${systemPrompt}\n\n${taskPrompt}` : systemPrompt;
+}
+
+describe("buildPrompt split output", () => {
+  it("splits persistent instructions from task-specific text", () => {
+    project.agentRules = "Always run pnpm test before pushing.";
+
+    const { systemPrompt, taskPrompt } = buildPrompt({
+      project,
+      projectId: "test-app",
+      issueId: "INT-1343",
+      issueContext: "## Linear Issue INT-1343\nTitle: Layered Prompt System",
+      userPrompt: "Focus on the API layer only.",
+    });
+
+    expect(systemPrompt).toContain(BASE_AGENT_PROMPT);
+    expect(systemPrompt).toContain("## Project Context");
+    expect(systemPrompt).toContain("## Project Rules");
+    expect(systemPrompt).toContain("## Task");
+    expect(systemPrompt).toContain("## Issue Details");
+    expect(systemPrompt).not.toContain("## Additional Instructions");
+
+    expect(taskPrompt).toContain("Focus on the API layer only.");
+    expect(taskPrompt).not.toContain("Work on issue #INT-1343");
+    expect(taskPrompt).not.toContain("Layered Prompt System");
   });
 
-  it("includes base prompt when issue is provided", () => {
-    const result = buildPrompt({
+  it("omits taskPrompt for bare spawns", () => {
+    const { taskPrompt } = buildPrompt({
+      project,
+      projectId: "test-app",
+    });
+
+    expect(taskPrompt).toBeUndefined();
+  });
+
+  it("renders the orchestrator back-channel with the literal orchestrator session ID", () => {
+    const { systemPrompt } = buildPrompt({
+      project,
+      projectId: "test-app",
+      orchestratorSessionId: "test-orchestrator",
+    });
+    expect(systemPrompt).toContain("## Talking to the Orchestrator");
+    expect(systemPrompt).toContain('ao send test-orchestrator "<your message>"');
+    // No env vars or shell-syntax variants — literal ID only.
+    expect(systemPrompt).not.toContain("AO_ORCHESTRATOR_SESSION_ID");
+    expect(systemPrompt).not.toContain("$env:");
+    expect(systemPrompt).not.toContain("%AO");
+  });
+
+  it("renders the same back-channel in the no-repo prompt when orchestrator exists", () => {
+    const { systemPrompt } = buildPrompt({
+      project: { ...project, repo: undefined },
+      projectId: "test-app",
+      orchestratorSessionId: "test-orchestrator",
+    });
+    expect(systemPrompt).toContain(BASE_AGENT_PROMPT_NO_REPO);
+    expect(systemPrompt).toContain('ao send test-orchestrator "<your message>"');
+  });
+
+  it("omits the orchestrator section when no orchestratorSessionId is provided", () => {
+    const { systemPrompt } = buildPrompt({ project, projectId: "test-app" });
+    expect(systemPrompt).not.toContain("## Talking to the Orchestrator");
+    expect(systemPrompt).not.toContain("ao send");
+  });
+});
+
+describe("buildPrompt", () => {
+  it("includes base prompt on bare spawns", () => {
+    const { systemPrompt, taskPrompt } = buildPrompt({ project, projectId: "test-app" });
+    expect(systemPrompt).toContain(BASE_AGENT_PROMPT);
+    expect(systemPrompt).toContain("## Project Context");
+    expect(systemPrompt).toContain("Project: Test App");
+    expect(taskPrompt).toBeUndefined();
+  });
+
+  it("includes base prompt when issue is provided without context", () => {
+    const { systemPrompt, taskPrompt } = buildPrompt({
       project,
       projectId: "test-app",
       issueId: "INT-1343",
     });
-    expect(result).not.toBeNull();
-    expect(result).toContain(BASE_AGENT_PROMPT);
+    expect(systemPrompt).toContain(BASE_AGENT_PROMPT);
+    expect(systemPrompt).toContain("Work on issue #INT-1343");
+    expect(taskPrompt).toContain("Work on issue #INT-1343");
+    expect(taskPrompt).toContain("Issue details were not pre-fetched");
   });
 
   it("includes project context", () => {
-    const result = buildPrompt({
+    const { systemPrompt } = buildPrompt({
       project,
       projectId: "test-app",
       issueId: "INT-1343",
     });
-    expect(result).toContain("Test App");
-    expect(result).toContain("org/test-app");
-    expect(result).toContain("main");
+    expect(systemPrompt).toContain("Test App");
+    expect(systemPrompt).toContain("org/test-app");
+    expect(systemPrompt).toContain("main");
   });
 
-  it("includes issue ID in task section", () => {
-    const result = buildPrompt({
+  it("uses trimmed base prompt when repo is not configured", () => {
+    const noRepoProject = { ...project, repo: undefined };
+    const { systemPrompt } = buildPrompt({ project: noRepoProject, projectId: "test-app" });
+    expect(systemPrompt).toContain(BASE_AGENT_PROMPT_NO_REPO);
+    expect(systemPrompt).not.toContain(BASE_AGENT_PROMPT);
+    expect(systemPrompt).not.toContain("create a PR");
+    expect(systemPrompt).not.toContain("PR Best Practices");
+    expect(systemPrompt).not.toContain("Repository:");
+  });
+
+  it("tells agent to fetch issue when context is missing", () => {
+    const { systemPrompt, taskPrompt } = buildPrompt({
       project,
       projectId: "test-app",
       issueId: "INT-1343",
     });
-    expect(result).toContain("Work on issue: INT-1343");
-    expect(result).toContain("feat/INT-1343");
+    expect(systemPrompt).toContain("Work on issue #INT-1343");
+    expect(systemPrompt).toContain("feat/INT-1343");
+    expect(taskPrompt).toContain("Work on issue #INT-1343");
+    expect(taskPrompt).toContain("Issue details were not pre-fetched");
+    expect(taskPrompt).toContain("gh issue view INT-1343");
   });
 
-  it("includes issue context when provided", () => {
-    const result = buildPrompt({
+  it("tells agent details are pre-fetched when context is provided", () => {
+    const { systemPrompt, taskPrompt } = buildPrompt({
       project,
       projectId: "test-app",
       issueId: "INT-1343",
       issueContext: "## Linear Issue INT-1343\nTitle: Layered Prompt System\nPriority: High",
     });
-    expect(result).toContain("## Issue Details");
-    expect(result).toContain("Layered Prompt System");
-    expect(result).toContain("Priority: High");
+    expect(systemPrompt).toContain("## Issue Details");
+    expect(systemPrompt).toContain("Layered Prompt System");
+    expect(systemPrompt).toContain("Priority: High");
+    expect(taskPrompt).toContain("Work on issue #INT-1343");
+    expect(taskPrompt).toContain("start implementing without re-fetching the issue");
+    expect(taskPrompt).not.toContain("Layered Prompt System");
+  });
+
+  it("normalizes issue ID with leading # to avoid double-hash", () => {
+    const { systemPrompt, taskPrompt } = buildPrompt({
+      project,
+      projectId: "test-app",
+      issueId: "#42",
+    });
+    expect(systemPrompt).toContain("Work on issue #42");
+    expect(systemPrompt).not.toContain("##42");
+    expect(taskPrompt).toContain("Work on issue #42");
+    expect(taskPrompt).not.toContain("##42");
   });
 
   it("includes inline agentRules", () => {
     project.agentRules = "Always run pnpm test before pushing.";
-    const result = buildPrompt({
+    const { systemPrompt } = buildPrompt({
       project,
       projectId: "test-app",
       issueId: "INT-1343",
     });
-    expect(result).toContain("## Project Rules");
-    expect(result).toContain("Always run pnpm test before pushing.");
+    expect(systemPrompt).toContain("## Project Rules");
+    expect(systemPrompt).toContain("Always run pnpm test before pushing.");
   });
 
   it("reads agentRulesFile content", () => {
@@ -93,13 +202,13 @@ describe("buildPrompt", () => {
     writeFileSync(rulesPath, "Use conventional commits.\nNo force pushes.");
     project.agentRulesFile = "agent-rules.md";
 
-    const result = buildPrompt({
+    const { systemPrompt } = buildPrompt({
       project,
       projectId: "test-app",
       issueId: "INT-1343",
     });
-    expect(result).toContain("Use conventional commits.");
-    expect(result).toContain("No force pushes.");
+    expect(systemPrompt).toContain("Use conventional commits.");
+    expect(systemPrompt).toContain("No force pushes.");
   });
 
   it("includes both agentRules and agentRulesFile", () => {
@@ -108,85 +217,81 @@ describe("buildPrompt", () => {
     writeFileSync(rulesPath, "File rule.");
     project.agentRulesFile = "rules.txt";
 
-    const result = buildPrompt({
+    const { systemPrompt } = buildPrompt({
       project,
       projectId: "test-app",
       issueId: "INT-1343",
     });
-    expect(result).toContain("Inline rule.");
-    expect(result).toContain("File rule.");
+    expect(systemPrompt).toContain("Inline rule.");
+    expect(systemPrompt).toContain("File rule.");
   });
 
   it("handles missing agentRulesFile gracefully", () => {
     project.agentRulesFile = "nonexistent-rules.md";
 
-    const result = buildPrompt({
+    const { systemPrompt } = buildPrompt({
       project,
       projectId: "test-app",
       issueId: "INT-1343",
     });
-    // Should not throw, should still build prompt without rules
-    expect(result).not.toBeNull();
-    expect(result).not.toContain("## Project Rules");
+    expect(systemPrompt).not.toContain("## Project Rules");
   });
 
   it("appends userPrompt last", () => {
     project.agentRules = "Project rule.";
-    const result = buildPrompt({
-      project,
-      projectId: "test-app",
-      issueId: "INT-1343",
-      userPrompt: "Focus on the API layer only.",
-    });
+    const prompt = combinePrompt(
+      buildPrompt({
+        project,
+        projectId: "test-app",
+        issueId: "INT-1343",
+        userPrompt: "Focus on the API layer only.",
+      }),
+    );
 
-    expect(result).not.toBeNull();
-    const promptStr = result!;
-
-    // User prompt should come after project rules
-    const rulesIdx = promptStr.indexOf("Project rule.");
-    const userIdx = promptStr.indexOf("Focus on the API layer only.");
+    const rulesIdx = prompt.indexOf("Project rule.");
+    const userIdx = prompt.indexOf("Focus on the API layer only.");
     expect(rulesIdx).toBeLessThan(userIdx);
-    expect(promptStr).toContain("## Additional Instructions");
   });
 
   it("builds prompt from rules alone (no issue)", () => {
     project.agentRules = "Always lint before committing.";
-    const result = buildPrompt({
-      project,
-      projectId: "test-app",
-    });
-    expect(result).not.toBeNull();
-    expect(result).toContain(BASE_AGENT_PROMPT);
-    expect(result).toContain("Always lint before committing.");
+    const prompt = combinePrompt(
+      buildPrompt({
+        project,
+        projectId: "test-app",
+      }),
+    );
+    expect(prompt).toContain(BASE_AGENT_PROMPT);
+    expect(prompt).toContain("Always lint before committing.");
   });
 
   it("builds prompt from userPrompt alone (no issue, no rules)", () => {
-    const result = buildPrompt({
+    const { systemPrompt, taskPrompt } = buildPrompt({
       project,
       projectId: "test-app",
-      userPrompt: "Just explore the codebase.",
+      userPrompt: "Focus on the API layer only.",
     });
-    expect(result).not.toBeNull();
-    expect(result).toContain("Just explore the codebase.");
+    expect(systemPrompt).toContain(BASE_AGENT_PROMPT);
+    expect(taskPrompt).toContain("Focus on the API layer only.");
   });
 
   it("includes tracker info in context", () => {
     project.tracker = { plugin: "linear" };
-    const result = buildPrompt({
+    const { systemPrompt } = buildPrompt({
       project,
       projectId: "test-app",
       issueId: "INT-100",
     });
-    expect(result).toContain("Tracker: linear");
+    expect(systemPrompt).toContain("Tracker: linear");
   });
 
   it("uses project name in context", () => {
-    const result = buildPrompt({
+    const { systemPrompt } = buildPrompt({
       project,
       projectId: "my-project",
       issueId: "INT-100",
     });
-    expect(result).toContain("Project: Test App");
+    expect(systemPrompt).toContain("Project: Test App");
   });
 
   it("includes reaction hints for auto send-to-agent reactions", () => {
@@ -194,13 +299,13 @@ describe("buildPrompt", () => {
       "ci-failed": { auto: true, action: "send-to-agent" },
       "approved-and-green": { auto: false, action: "notify" },
     };
-    const result = buildPrompt({
+    const { systemPrompt } = buildPrompt({
       project,
       projectId: "test-app",
       issueId: "INT-100",
     });
-    expect(result).toContain("ci-failed");
-    expect(result).not.toContain("approved-and-green");
+    expect(systemPrompt).toContain("ci-failed");
+    expect(systemPrompt).not.toContain("approved-and-green");
   });
 });
 

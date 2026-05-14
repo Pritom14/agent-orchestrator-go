@@ -1,15 +1,14 @@
 import {
   shellEscape,
   normalizeAgentPermissionMode,
-  buildAgentPath,
-  setupPathWrapperWorkspace,
   readLastActivityEntry,
   checkActivityLogState,
   getActivityFallbackState,
   recordTerminalActivity,
-  PREFERRED_GH_PATH,
+  hasRecentCommits,
   DEFAULT_READY_THRESHOLD_MS,
   DEFAULT_ACTIVE_WINDOW_MS,
+  isWindows,
   type Agent,
   type AgentSessionInfo,
   type AgentLaunchConfig,
@@ -24,29 +23,13 @@ import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { stat, access, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { constants } from "node:fs";
+import { constants, readFileSync } from "node:fs";
 
 const execFileAsync = promisify(execFile);
 
 // =============================================================================
 // Aider Activity Detection Helpers
 // =============================================================================
-
-/**
- * Check if Aider has made recent commits (within last 60 seconds).
- */
-async function hasRecentCommits(workspacePath: string): Promise<boolean> {
-  try {
-    const { stdout } = await execFileAsync(
-      "git",
-      ["log", "--since=60 seconds ago", "--format=%H"],
-      { cwd: workspacePath, timeout: 5_000 },
-    );
-    return stdout.trim().length > 0;
-  } catch {
-    return false;
-  }
-}
 
 /**
  * Get modification time of Aider chat history file.
@@ -125,7 +108,12 @@ function createAiderAgent(): Agent {
       }
 
       if (config.systemPromptFile) {
-        parts.push("--system-prompt", `"$(cat ${shellEscape(config.systemPromptFile)})"`);
+        if (isWindows()) {
+          const content = readFileSync(config.systemPromptFile, "utf-8");
+          parts.push("--system-prompt", shellEscape(content));
+        } else {
+          parts.push("--system-prompt", `"$(cat ${shellEscape(config.systemPromptFile)})"`);
+        }
       } else if (config.systemPrompt) {
         parts.push("--system-prompt", shellEscape(config.systemPrompt));
       }
@@ -145,9 +133,7 @@ function createAiderAgent(): Agent {
         env["AO_ISSUE_ID"] = config.issueId;
       }
 
-      // Prepend ~/.ao/bin to PATH so our gh/git wrappers intercept commands.
-      env["PATH"] = buildAgentPath(process.env["PATH"]);
-      env["GH_PATH"] = PREFERRED_GH_PATH;
+      // PATH and GH_PATH are injected by session-manager for all agents.
 
       return env;
     },
@@ -227,6 +213,8 @@ function createAiderAgent(): Agent {
     async isProcessRunning(handle: RuntimeHandle): Promise<boolean> {
       try {
         if (handle.runtimeName === "tmux" && handle.id) {
+          // ps -eo is Unix-only; guard against stale tmux handles on Windows
+          if (isWindows()) return false;
           const { stdout: ttyOut } = await execFileAsync(
             "tmux",
             ["list-panes", "-t", handle.id, "-F", "#{pane_tty}"],
@@ -294,13 +282,12 @@ function createAiderAgent(): Agent {
       return null;
     },
 
-    async setupWorkspaceHooks(workspacePath: string, _config: WorkspaceHooksConfig): Promise<void> {
-      await setupPathWrapperWorkspace(workspacePath);
+    async setupWorkspaceHooks(_workspacePath: string, _config: WorkspaceHooksConfig): Promise<void> {
+      // PATH wrappers are installed by session-manager for all agents.
     },
 
-    async postLaunchSetup(session: Session): Promise<void> {
-      if (!session.workspacePath) return;
-      await setupPathWrapperWorkspace(session.workspacePath);
+    async postLaunchSetup(_session: Session): Promise<void> {
+      // PATH wrappers are re-ensured by session-manager.
     },
   };
 }
@@ -315,7 +302,11 @@ export function create(): Agent {
 
 export function detect(): boolean {
   try {
-    execFileSync("aider", ["--version"], { stdio: "ignore" });
+    execFileSync("aider", ["--version"], {
+      stdio: "ignore",
+      shell: isWindows(),
+      windowsHide: true,
+    });
     return true;
   } catch {
     return false;

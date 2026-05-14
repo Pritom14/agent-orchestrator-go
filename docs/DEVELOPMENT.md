@@ -22,8 +22,8 @@ Every abstraction is a swappable plugin. All interfaces are defined in [`package
 
 | Slot      | Interface   | Default       | Alternatives                             |
 | --------- | ----------- | ------------- | ---------------------------------------- |
-| Runtime   | `Runtime`   | `tmux`        | `process`, `docker`, `k8s`, `ssh`, `e2b` |
-| Agent     | `Agent`     | `claude-code` | `codex`, `aider`, `opencode`             |
+| Runtime   | `Runtime`   | `tmux` (Unix) / `process` (Windows; ConPTY via node-pty) | `process`, `docker`, `k8s`, `ssh`, `e2b` |
+| Agent     | `Agent`     | `claude-code` | `codex`, `aider`, `cursor`, `kimicode`, `opencode` |
 | Workspace | `Workspace` | `worktree`    | `clone`                                  |
 | Tracker   | `Tracker`   | `github`      | `linear`                                 |
 | SCM       | `SCM`       | `github`      | —                                        |
@@ -44,7 +44,7 @@ const dataDir = `~/.agent-orchestrator/${instanceId}`;
 This means:
 
 - Multiple orchestrator checkouts on the same machine never collide
-- Session names are globally unique in tmux: `{hash}-{prefix}-{num}`
+- Runtime handles are globally unique: `{hash}-{prefix}-{num}` (tmux session name on Unix; suffix of the named pipe `\\.\pipe\ao-pty-{sessionId}` on Windows)
 - User-facing names stay clean: `ao-1`, `myapp-2`
 
 ### Session Lifecycle
@@ -65,12 +65,23 @@ Activity states (orthogonal to lifecycle): `active`, `ready`, `idle`, `waiting_i
 | ---------------------------------------- | ----------------------------------------------- |
 | `packages/core/src/session-manager.ts`   | Session CRUD: spawn, list, kill, send, restore  |
 | `packages/core/src/lifecycle-manager.ts` | State machine, polling loop, reactions engine   |
-| `packages/core/src/prompt-builder.ts`    | 3-layer prompt assembly (base + config + rules) |
+| `packages/core/src/prompt-builder.ts`    | Layered worker prompt assembly (system + task)  |
 | `packages/core/src/config.ts`            | Config loading and Zod validation               |
 | `packages/core/src/plugin-registry.ts`   | Plugin discovery, loading, resolution           |
 | `packages/core/src/agent-selection.ts`   | Resolves worker vs orchestrator agent roles     |
 | `packages/core/src/observability.ts`     | Correlation IDs, structured logging, metrics    |
 | `packages/core/src/paths.ts`             | Hash-based path and session name generation     |
+
+### Working Principles
+
+These apply to both human contributors and AI agents:
+
+1. **Think before coding.** If a task is ambiguous, ask for clarification. If multiple approaches exist, present the tradeoff.
+2. **Minimum code.** No speculative features. No abstractions for code used once. Plugin slots exist for extensibility - use them instead of config proliferation.
+3. **Surgical diffs.** Don't touch files outside your change scope. Don't reformat adjacent code. Match existing patterns even if you prefer differently. Every changed line should trace to a specific requirement.
+4. **Verifiable goals.** Before implementing, state what "done" looks like and how to verify it. For bug fixes: write a test that reproduces the bug first.
+
+For AI agent-specific guidance (including high-risk files like `types.ts`, `lifecycle-manager.ts`, `globals.css`), see CLAUDE.md -> Working Principles.
 
 ---
 
@@ -288,8 +299,10 @@ spawn(config)
   ├─ Determine branch name
   ├─ Create workspace (Workspace.create)
   ├─ Generate issue prompt (Tracker.generatePrompt)
+  ├─ Assemble layered prompt (prompt-builder.ts) → {systemPrompt, taskPrompt}
+  ├─ Persist worker system prompt file
+  ├─ For OpenCode workers: write OPENCODE_CONFIG pointing at that file
   ├─ Build agent launch command (Agent.getLaunchCommand)
-  ├─ Assemble full prompt (prompt-builder.ts)
   ├─ Create runtime session (Runtime.create)
   ├─ Post-launch setup (Agent.postLaunchSetup, optional)
   └─ Write metadata file → return Session
@@ -301,11 +314,13 @@ If issue validation fails, nothing is created — fail before allocating resourc
 
 ## Prompt Assembly
 
-Prompts are built in three layers (`packages/core/src/prompt-builder.ts`):
+Worker prompts are built in three persistent layers (`packages/core/src/prompt-builder.ts`):
 
 1. **Base agent guidance** — standard instructions for all sessions (git workflow, PR conventions, lifecycle hooks)
-2. **Config context** — project-specific info (repo, branch, issue details, agent rules from `agentRules` / `agentRulesFile`)
-3. **User rules** — inlined last, highest priority
+2. **Config context** — project-specific info (repo, branch, tracker, issue details, automated reactions)
+3. **Project rules** — content from `agentRules` / `agentRulesFile`
+
+The explicit user request is returned separately as `taskPrompt`. This lets session manager persist stable system instructions to disk while still sending only task-specific text to agents that need post-launch prompt delivery.
 
 Orchestrator sessions use a separate prompt from `packages/core/src/orchestrator-prompt.ts`.
 
@@ -373,8 +388,11 @@ cat ~/.agent-orchestrator/{hash}-{project}/sessions/{session-id}
 # Check API state
 curl http://localhost:3000/api/sessions/{session-id}
 
-# Attach to tmux session directly
+# Attach to the runtime session directly
+# Unix:
 tmux attach -t {hash}-{prefix}-{num}
+# Windows: there's no tmux. Use the AO command, which connects to \\.\pipe\ao-pty-<sessionId>:
+ao session attach <sessionId>
 
 # Enable verbose logging
 AO_LOG_LEVEL=debug ao start
@@ -454,10 +472,10 @@ Debuggability: `cat ~/.agent-orchestrator/a3b4-myapp/sessions/ao-1` shows full s
 Simpler local setup (no ngrok), survives orchestrator restarts, works offline. CI/review state is fetched, not pushed.
 
 **Why plugin slots?**
-Swappability: use tmux locally, Docker in CI, Kubernetes in prod — without changing application code. Testability: mock any plugin in unit tests. Extensibility: users add company-specific plugins without forking.
+Swappability: use `process` (ConPTY) on Windows, tmux on Linux/macOS, Docker in CI, Kubernetes in prod — without changing application code. The `Runtime` interface is the layer that lets the same agent/workspace/tracker stack run across all of them. Testability: mock any plugin in unit tests. Extensibility: users add company-specific plugins without forking.
 
 **Why hash-based namespacing?**
-Multiple orchestrator checkouts on the same machine don't collide in tmux or on disk. Different checkouts get different hashes; projects within the same config share a hash.
+Multiple orchestrator checkouts on the same machine don't collide at the runtime layer (tmux session names on Unix, named-pipe paths on Windows) or on disk. Different checkouts get different hashes; projects within the same config share a hash.
 
 **Why ESM with `.js` extensions?**
 Node.js ESM requires explicit extensions on local imports. All packages use `"type": "module"`. Missing extensions cause runtime errors.

@@ -17,7 +17,7 @@ Every interface the system uses is defined here. If you're working on any part o
 
 **Main interfaces:**
 
-- `Runtime` — where sessions execute (tmux, docker, k8s)
+- `Runtime` — where sessions execute (tmux on Unix, `process` / ConPTY via node-pty on Windows, docker, k8s)
 - `Agent` — AI coding tool adapter (claude-code, codex, aider)
 - `Workspace` — code isolation (worktree, clone)
 - `Tracker` — issue tracking (GitHub Issues, Linear)
@@ -47,13 +47,16 @@ Handles session lifecycle:
 4. Determine branch name
 5. Create workspace via `Workspace.create()`
 6. Generate prompt via `Tracker.generatePrompt()`
-7. Build launch command via `Agent.getLaunchCommand()`
-8. Create runtime session via `Runtime.create()`
-9. Run `Agent.postLaunchSetup()` (optional)
-10. Write metadata file
-11. Return Session object
+7. Build layered worker prompt via `buildPrompt()` into `systemPrompt` + `taskPrompt`
+8. Persist `systemPromptFile` for the session and, for OpenCode workers, write `OPENCODE_CONFIG`
+9. Build launch command via `Agent.getLaunchCommand()`
+10. Create runtime session via `Runtime.create()`
+11. Run `Agent.postLaunchSetup()` (optional)
+12. Write metadata file
+13. Return Session object
 
 **Note:** If issue validation fails (not found, auth error), spawn fails before creating any resources (no workspace, no runtime, no session ID). This prevents spawning sessions with broken issue references.
+Worker sessions keep persistent instructions in the prompt file. OpenCode workers consume that file through `OPENCODE_CONFIG`, while OpenCode orchestrators continue to project their system prompt into workspace `AGENTS.md`.
 
 ### `src/services/lifecycle-manager.ts` — State Machine + Reactions
 
@@ -93,7 +96,7 @@ Loads plugins and provides access to them:
 **Built-in plugins** (loaded by default):
 
 - runtime-tmux, runtime-process
-- agent-claude-code, agent-codex, agent-aider, agent-opencode
+- agent-claude-code, agent-codex, agent-aider, agent-cursor, agent-kimicode, agent-opencode
 - workspace-worktree, workspace-clone
 - tracker-github, tracker-linear, tracker-gitlab
 - scm-github, scm-gitlab
@@ -233,6 +236,6 @@ This package is a dependency of all other packages. Build it first if working on
 
 **Why plugin slots?**
 
-- Swappability: use tmux locally, docker in CI, k8s in prod
+- Swappability: use tmux on Linux/macOS, `process` (ConPTY) on Windows, docker in CI, k8s in prod — same agent/workspace stack across all of them
 - Testability: mock plugins for tests
 - Extensibility: users can add custom plugins (e.g., company-specific notifier)

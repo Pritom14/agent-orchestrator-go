@@ -11,7 +11,7 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { resolve, basename } from "node:path";
+import { resolve, basename, dirname } from "node:path";
 import { cwd } from "node:process";
 import chalk from "chalk";
 import ora from "ora";
@@ -20,25 +20,29 @@ import {
   loadConfig,
   generateOrchestratorPrompt,
   generateSessionPrefix,
-  findConfigFile,
+  getOrchestratorSessionId,
   isRepoUrl,
-  parseRepoUrl,
-  resolveCloneTarget,
-  isRepoAlreadyCloned,
-  generateConfigFromUrl,
   configToYaml,
-  normalizeOrchestratorSessionStrategy,
-  isOrchestratorSession,
+  isCanonicalGlobalConfigPath,
   isTerminalSession,
-  ConfigNotFoundError,
+  getDefaultRuntime,
+  isWindows,
+  findPidByPort,
+  killProcessTree,
+  loadLocalProjectConfigDetailed,
+  registerProjectInGlobalConfig,
+  getGlobalConfigPath,
   type OrchestratorConfig,
+  type LocalProjectConfig,
   type ProjectConfig,
   type ParsedRepoUrl,
+  writeLocalProjectConfig,
 } from "@aoagents/ao-core";
 import { parse as yamlParse, stringify as yamlStringify } from "yaml";
-import { exec, execSilent, git } from "../lib/shell.js";
+import { exec, execSilent, forwardSignalsToChild, git } from "../lib/shell.js";
 import { getSessionManager } from "../lib/create-session-manager.js";
-import { ensureLifecycleWorker, stopAllLifecycleWorkers } from "../lib/lifecycle-service.js";
+import { listLifecycleWorkers } from "../lib/lifecycle-service.js";
+import { startBunTmpJanitor } from "../lib/bun-tmp-janitor.js";
 import {
   findWebDir,
   buildDashboardEnv,
@@ -48,31 +52,111 @@ import {
   findFreePort,
   MAX_PORT_SCAN,
 } from "../lib/web-dir.js";
-import { rebuildDashboardProductionArtifacts } from "../lib/dashboard-rebuild.js";
+import {
+  clearStaleCacheIfNeeded,
+  rebuildDashboardProductionArtifacts,
+} from "../lib/dashboard-rebuild.js";
 import { preflight } from "../lib/preflight.js";
-import { register, unregister, isAlreadyRunning, getRunning, waitForExit } from "../lib/running-state.js";
-import { preventIdleSleep } from "../lib/prevent-sleep.js";
+import {
+  register,
+  isAlreadyRunning,
+  getRunning,
+  unregister,
+  acquireStartupLock,
+  writeLastStop,
+  readLastStop,
+  clearLastStop,
+  type RunningState,
+} from "../lib/running-state.js";
+import { attachToDaemon, killExistingDaemon } from "../lib/daemon.js";
+import { startProjectSupervisor } from "../lib/project-supervisor.js";
 import { isHumanCaller } from "../lib/caller-context.js";
 import { detectEnvironment } from "../lib/detect-env.js";
-import { detectAgentRuntime, detectAvailableAgents, type DetectedAgent } from "../lib/detect-agent.js";
+import {
+  detectAgentRuntime,
+  detectAvailableAgents,
+  type DetectedAgent,
+} from "../lib/detect-agent.js";
 import { detectDefaultBranch } from "../lib/git-utils.js";
-import { promptConfirm, promptSelect } from "../lib/prompts.js";
+import { promptConfirm, promptSelect, promptText } from "../lib/prompts.js";
+import { extractOwnerRepo, isValidRepoString } from "../lib/repo-utils.js";
 import {
   detectProjectType,
   generateRulesFromTemplates,
   formatProjectTypeForDisplay,
 } from "../lib/project-detection.js";
 import { formatCommandError } from "../lib/cli-errors.js";
-import { detectOpenClawInstallation } from "../lib/openclaw-probe.js";
-import { applyOpenClawCredentials } from "../lib/credential-resolver.js";
 import { findProjectForDirectory } from "../lib/project-resolution.js";
+import {
+  type InstallAttempt,
+  canPromptForInstall,
+  genericInstallHints,
+  askYesNo,
+  runInteractiveCommand,
+  tryInstallWithAttempts,
+} from "../lib/install-helpers.js";
+import { ensureGit, runtimePreflight } from "../lib/startup-preflight.js";
+import { installShutdownHandlers } from "../lib/shutdown.js";
+import { resolveOrCreateProject } from "../lib/resolve-project.js";
+import { pathsEqual } from "../lib/path-equality.js";
+import { maybePromptForUpdateChannel } from "../lib/update-channel-onboarding.js";
 
 import { DEFAULT_PORT } from "../lib/constants.js";
-const IS_TTY = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+import { projectSessionUrl } from "../lib/routes.js";
 
 // =============================================================================
 // HELPERS
 // =============================================================================
+
+function readProjectBehaviorConfig(projectPath: string): LocalProjectConfig {
+  const localConfig = loadLocalProjectConfigDetailed(projectPath);
+  if (localConfig.kind === "loaded") {
+    return { ...localConfig.config };
+  }
+  return {};
+}
+
+function writeProjectBehaviorConfig(projectPath: string, config: LocalProjectConfig): void {
+  writeLocalProjectConfig(projectPath, config);
+}
+
+/**
+ * Register a flat local config (agent-orchestrator.yaml without `projects:`)
+ * into the global config so loadConfig can resolve it.
+ * Returns the registered project ID, or null if registration failed.
+ */
+async function registerFlatConfig(configPath: string): Promise<string | null> {
+  const projectPath = resolve(dirname(configPath));
+  const projectId = basename(projectPath);
+
+  // Read flat config fields
+  const raw = readFileSync(configPath, "utf-8");
+  const parsed = yamlParse(raw) as Record<string, unknown> | null;
+  if (!parsed || typeof parsed !== "object") return null;
+  // If it has a projects key, it's not a flat config
+  if ("projects" in parsed) return null;
+
+  const repo = typeof parsed["repo"] === "string" ? parsed["repo"] : undefined;
+  const defaultBranch =
+    typeof parsed["defaultBranch"] === "string"
+      ? parsed["defaultBranch"]
+      : await detectDefaultBranch(projectPath, repo ?? null);
+  // Strip characters invalid in sessionPrefix (Zod: [a-zA-Z0-9_-]+)
+  // so folder names like "my.app" don't produce invalid prefixes.
+  const prefixInput = projectId.replace(/[^a-zA-Z0-9_-]/g, "-").replace(/^-+|-+$/g, "");
+  const prefix = generateSessionPrefix(prefixInput || projectId);
+
+  console.log(chalk.dim(`\n  Registering project "${projectId}" in global config...\n`));
+
+  const registeredProjectId = registerProjectInGlobalConfig(projectId, projectId, projectPath, {
+    defaultBranch,
+    sessionPrefix: prefix,
+    ...(repo ? { repo } : {}),
+  });
+
+  console.log(chalk.green(`  ✓ Registered "${registeredProjectId}"\n`));
+  return registeredProjectId;
+}
 
 /**
  * Resolve project from config.
@@ -83,7 +167,7 @@ async function resolveProject(
   config: OrchestratorConfig,
   projectArg?: string,
   action = "start",
-): Promise<{ projectId: string; project: ProjectConfig }> {
+): Promise<{ projectId: string; project: ProjectConfig; config: OrchestratorConfig }> {
   const projectIds = Object.keys(config.projects);
 
   if (projectIds.length === 0) {
@@ -98,13 +182,13 @@ async function resolveProject(
         `Project "${projectArg}" not found. Available projects:\n  ${projectIds.join(", ")}`,
       );
     }
-    return { projectId: projectArg, project };
+    return { projectId: projectArg, project, config };
   }
 
   // Only one project — use it
   if (projectIds.length === 1) {
     const projectId = projectIds[0];
-    return { projectId, project: config.projects[projectId] };
+    return { projectId, project: config.projects[projectId], config };
   }
 
   // Multiple projects — try matching cwd to a project path
@@ -112,20 +196,57 @@ async function resolveProject(
   const currentDir = resolve(cwd());
   const matchedProjectId = findProjectForDirectory(config.projects, currentDir);
   if (matchedProjectId) {
-    return { projectId: matchedProjectId, project: config.projects[matchedProjectId] };
+    return { projectId: matchedProjectId, project: config.projects[matchedProjectId], config };
   }
 
   // No match — prompt if interactive, otherwise error
   if (isHumanCaller()) {
-    const projectId = await promptSelect(
-      `Choose project to ${action}:`,
-      projectIds.map((id) => ({
+    // Check if cwd is a git repo not yet in the config — offer to add it
+    const currentDirResolved = resolve(cwd());
+    const cwdAlreadyInConfig = projectIds.some((id) => {
+      try {
+        return pathsEqual(config.projects[id].path, currentDirResolved);
+      } catch {
+        return false;
+      }
+    });
+    const cwdIsGitRepo = existsSync(resolve(currentDirResolved, ".git"));
+    const addOption =
+      !cwdAlreadyInConfig && cwdIsGitRepo
+        ? [
+            {
+              value: "__add_cwd__",
+              label: `Add ${basename(currentDirResolved)}`,
+              hint: "register this directory as a new project",
+            },
+          ]
+        : [];
+
+    const projectId = await promptSelect(`Choose project to ${action}:`, [
+      ...projectIds.map((id) => ({
         value: id,
         label: config.projects[id].name ?? id,
         hint: id,
       })),
-    );
-    return { projectId, project: config.projects[projectId] };
+      ...addOption,
+    ]);
+
+    if (projectId === "__add_cwd__") {
+      const addedId = await addProjectToConfig(config, currentDirResolved);
+      // Return the reloaded config too — addProjectToConfig writes the
+      // (possibly hashed) project ID to disk, so any caller that holds the
+      // pre-add `config` reference would not see the new key. Without this,
+      // downstream consumers like `ensureLifecycleWorker(config, projectId)`
+      // throw `Unknown project: ...` even though the registration succeeded.
+      const reloadedConfig = loadConfig(config.configPath);
+      return {
+        projectId: addedId,
+        project: reloadedConfig.projects[addedId],
+        config: reloadedConfig,
+      };
+    }
+
+    return { projectId, project: config.projects[projectId], config };
   } else {
     throw new Error(
       `Multiple projects configured. Specify which one to ${action}:\n  ${projectIds.map((id) => `ao ${action} ${id}`).join("\n  ")}`,
@@ -144,49 +265,19 @@ async function resolveProject(
 async function resolveProjectByRepo(
   config: OrchestratorConfig,
   parsed: ParsedRepoUrl,
-): Promise<{ projectId: string; project: ProjectConfig }> {
+): Promise<{ projectId: string; project: ProjectConfig; config: OrchestratorConfig }> {
   const projectIds = Object.keys(config.projects);
 
   // Try to match by repo field (e.g. "owner/repo")
   for (const id of projectIds) {
     const project = config.projects[id];
     if (project.repo === parsed.ownerRepo) {
-      return { projectId: id, project };
+      return { projectId: id, project, config };
     }
   }
 
   // No repo match — fall back to standard resolution (works for single-project)
   return await resolveProject(config);
-}
-
-interface InstallAttempt {
-  cmd: string;
-  args: string[];
-  label: string;
-}
-
-function canPromptForInstall(): boolean {
-  return isHumanCaller() && IS_TTY;
-}
-
-function genericInstallHints(command: string): string[] {
-  switch (command) {
-    case "node":
-    case "npm":
-      return ["Install Node.js/npm from https://nodejs.org/"];
-    case "pnpm":
-      return [
-        "corepack enable && corepack prepare pnpm@latest --activate",
-        "npm install -g pnpm",
-      ];
-    case "pipx":
-      return [
-        "python3 -m pip install --user pipx",
-        "python3 -m pipx ensurepath",
-      ];
-    default:
-      return [];
-  }
 }
 
 /**
@@ -196,7 +287,7 @@ function genericInstallHints(command: string): string[] {
  */
 async function promptAgentSelection(): Promise<{
   orchestratorAgent: string;
-  workerAgent: string
+  workerAgent: string;
 } | null> {
   if (canPromptForInstall()) {
     const available = await detectAvailableAgents();
@@ -216,57 +307,21 @@ async function promptAgentSelection(): Promise<{
   }
 }
 
-async function askYesNo(
-  question: string,
-  defaultYes = true,
-  nonInteractiveDefault = defaultYes,
-): Promise<boolean> {
-  if (!canPromptForInstall()) return nonInteractiveDefault;
-  return await promptConfirm(question, defaultYes);
-}
-
-function gitInstallAttempts(): InstallAttempt[] {
-  if (process.platform === "darwin") {
-    return [{ cmd: "brew", args: ["install", "git"], label: "brew install git" }];
-  }
-  if (process.platform === "linux") {
-    return [
-      { cmd: "sudo", args: ["apt-get", "install", "-y", "git"], label: "sudo apt-get install -y git" },
-      { cmd: "sudo", args: ["dnf", "install", "-y", "git"], label: "sudo dnf install -y git" },
-    ];
-  }
-  if (process.platform === "win32") {
-    return [
-      {
-        cmd: "winget",
-        args: ["install", "--id", "Git.Git", "-e", "--source", "winget"],
-        label: "winget install --id Git.Git -e --source winget",
-      },
-    ];
-  }
-  return [];
-}
-
-function gitInstallHints(): string[] {
-  if (process.platform === "darwin") return ["brew install git"];
-  if (process.platform === "win32") return ["winget install --id Git.Git -e --source winget"];
-  return [
-    "sudo apt install git      # Debian/Ubuntu",
-    "sudo dnf install git      # Fedora/RHEL",
-  ];
-}
-
 function ghInstallAttempts(): InstallAttempt[] {
   if (process.platform === "darwin") {
     return [{ cmd: "brew", args: ["install", "gh"], label: "brew install gh" }];
   }
   if (process.platform === "linux") {
     return [
-      { cmd: "sudo", args: ["apt-get", "install", "-y", "gh"], label: "sudo apt-get install -y gh" },
+      {
+        cmd: "sudo",
+        args: ["apt-get", "install", "-y", "gh"],
+        label: "sudo apt-get install -y gh",
+      },
       { cmd: "sudo", args: ["dnf", "install", "-y", "gh"], label: "sudo dnf install -y gh" },
     ];
   }
-  if (process.platform === "win32") {
+  if (isWindows()) {
     return [
       {
         cmd: "winget",
@@ -276,71 +331,6 @@ function ghInstallAttempts(): InstallAttempt[] {
     ];
   }
   return [];
-}
-
-async function runInteractiveCommand(cmd: string, args: string[]): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    const child = spawn(cmd, args, { stdio: "inherit" });
-    child.once("error", (err) => {
-      reject(
-        formatCommandError(err, {
-          cmd,
-          args,
-          action: "run an interactive installer",
-          installHints: genericInstallHints(cmd),
-        }),
-      );
-    });
-    child.once("close", (code) => {
-      if (code === 0) {
-        resolve();
-        return;
-      }
-      reject(new Error(`Command failed (${code ?? "unknown"}): ${cmd} ${args.join(" ")}`));
-    });
-  });
-}
-
-async function tryInstallWithAttempts(
-  attempts: InstallAttempt[],
-  verify: () => Promise<boolean>,
-): Promise<boolean> {
-  for (const attempt of attempts) {
-    try {
-      console.log(chalk.dim(`  Running: ${attempt.label}`));
-      await runInteractiveCommand(attempt.cmd, attempt.args);
-      if (await verify()) return true;
-    } catch {
-      // Try next installer
-    }
-  }
-  return verify();
-}
-
-async function ensureGit(context: string): Promise<void> {
-  const hasGit = (await execSilent("git", ["--version"])) !== null;
-  if (hasGit) return;
-
-  console.log(chalk.yellow(`⚠ Git is required for ${context}.`));
-  const shouldInstall = await askYesNo("Install Git now?", true, false);
-  if (shouldInstall) {
-    const installed = await tryInstallWithAttempts(
-      gitInstallAttempts(),
-      async () => (await execSilent("git", ["--version"])) !== null,
-    );
-    if (installed) {
-      console.log(chalk.green("  ✓ Git installed successfully"));
-      return;
-    }
-  }
-
-  console.error(chalk.red("\n✗ Git is required but is not installed.\n"));
-  console.log(chalk.bold("  Install Git manually, then re-run ao start:\n"));
-  for (const hint of gitInstallHints()) {
-    console.log(chalk.cyan(`    ${hint}`));
-  }
-  console.log();
-  process.exit(1);
 }
 
 interface AgentInstallOption {
@@ -375,24 +365,29 @@ const AGENT_INSTALL_OPTIONS: AgentInstallOption[] = [
     cmd: "npm",
     args: ["install", "-g", "opencode-ai"],
   },
+  {
+    id: "kimicode",
+    label: "Kimi Code",
+    cmd: "uv",
+    args: ["tool", "install", "kimi-cli"],
+  },
 ];
 
 async function promptInstallAgentRuntime(available: DetectedAgent[]): Promise<DetectedAgent[]> {
   if (available.length > 0 || !canPromptForInstall()) return available;
 
   console.log(chalk.yellow("⚠ No supported agent runtime detected."));
-  console.log(chalk.dim("  You can install one now (recommended) or continue and install later.\n"));
-  const choice = await promptSelect(
-    "Choose runtime to install:",
-    [
-      ...AGENT_INSTALL_OPTIONS.map((option) => ({
-        value: option.id,
-        label: option.label,
-        hint: [option.cmd, ...option.args].join(" "),
-      })),
-      { value: "skip", label: "Skip for now" },
-    ],
+  console.log(
+    chalk.dim("  You can install one now (recommended) or continue and install later.\n"),
   );
+  const choice = await promptSelect("Choose runtime to install:", [
+    ...AGENT_INSTALL_OPTIONS.map((option) => ({
+      value: option.id,
+      label: option.label,
+      hint: [option.cmd, ...option.args].join(" "),
+    })),
+    { value: "skip", label: "Skip for now" },
+  ]);
   if (choice === "skip") {
     return available;
   }
@@ -404,7 +399,10 @@ async function promptInstallAgentRuntime(available: DetectedAgent[]): Promise<De
 
   console.log(chalk.dim(`  Installing ${selected.label}...`));
   try {
-    await runInteractiveCommand(selected.cmd, selected.args);
+    await runInteractiveCommand(selected.cmd, selected.args, {
+      action: `install ${selected.label}`,
+      installHints: genericInstallHints(selected.cmd),
+    });
     const refreshed = await detectAvailableAgents();
     if (refreshed.length > 0) {
       console.log(chalk.green(`  ✓ ${selected.label} installed successfully`));
@@ -433,9 +431,11 @@ async function cloneRepo(parsed: ParsedRepoUrl, targetDir: string, cwd: string):
     const ghAvailable = (await execSilent("gh", ["auth", "status"])) !== null;
     if (ghAvailable) {
       try {
-        await exec("gh", ["repo", "clone", parsed.ownerRepo, targetDir, "--", "--depth", "1"], {
-          cwd,
-        });
+        await runInteractiveCommand(
+          "gh",
+          ["repo", "clone", parsed.ownerRepo, targetDir, "--", "--depth", "1"],
+          { cwd, action: "clone repository via gh" },
+        );
         return;
       } catch {
         // gh clone failed — fall through to git clone with SSH
@@ -443,86 +443,23 @@ async function cloneRepo(parsed: ParsedRepoUrl, targetDir: string, cwd: string):
     }
   }
 
-  // 2. Try git clone with SSH URL (works with SSH keys for private repos)
+  // 2. Try git clone with SSH URL (works for SSH keys, may prompt for host key)
   const sshUrl = `git@${parsed.host}:${parsed.ownerRepo}.git`;
   try {
-    await exec("git", ["clone", "--depth", "1", sshUrl, targetDir], { cwd });
+    await runInteractiveCommand("git", ["clone", "--depth", "1", sshUrl, targetDir], {
+      cwd,
+      action: "clone repository via git (ssh)",
+    });
     return;
   } catch {
     // SSH failed — fall through to HTTPS
   }
 
   // 3. Final fallback: HTTPS (works for public repos)
-  await exec("git", ["clone", "--depth", "1", parsed.cloneUrl, targetDir], { cwd });
-}
-
-/**
- * Handle `ao start <url>` — clone repo, generate config, return loaded config.
- * Also returns the parsed URL so the caller can match by repo when the config
- * contains multiple projects.
- */
-async function handleUrlStart(
-  url: string,
-): Promise<{ config: OrchestratorConfig; parsed: ParsedRepoUrl; autoGenerated: boolean }> {
-  const spinner = ora();
-
-  // 1. Parse URL
-  spinner.start("Parsing repository URL");
-  const parsed = parseRepoUrl(url);
-  spinner.succeed(`Repository: ${chalk.cyan(parsed.ownerRepo)} (${parsed.host})`);
-
-  await ensureGit("repository cloning");
-
-  // 2. Determine target directory
-  const cwd = process.cwd();
-  const targetDir = resolveCloneTarget(parsed, cwd);
-  const alreadyCloned = isRepoAlreadyCloned(targetDir, parsed.cloneUrl);
-
-  // 3. Clone or reuse
-  if (alreadyCloned) {
-    console.log(chalk.green(`  Reusing existing clone at ${targetDir}`));
-  } else {
-    spinner.start(`Cloning ${parsed.ownerRepo}`);
-    try {
-      await cloneRepo(parsed, targetDir, cwd);
-      spinner.succeed(`Cloned to ${targetDir}`);
-    } catch (err) {
-      spinner.fail("Clone failed");
-      throw new Error(
-        `Failed to clone ${parsed.ownerRepo}: ${err instanceof Error ? err.message : String(err)}`,
-        { cause: err },
-      );
-    }
-  }
-
-  // 4. Check for existing config
-  const configPath = resolve(targetDir, "agent-orchestrator.yaml");
-  const configPathAlt = resolve(targetDir, "agent-orchestrator.yml");
-
-  if (existsSync(configPath)) {
-    console.log(chalk.green(`  Using existing config: ${configPath}`));
-    return { config: loadConfig(configPath), parsed, autoGenerated: false };
-  }
-
-  if (existsSync(configPathAlt)) {
-    console.log(chalk.green(`  Using existing config: ${configPathAlt}`));
-    return { config: loadConfig(configPathAlt), parsed, autoGenerated: false };
-  }
-
-  // 5. Auto-generate config with a free port
-  spinner.start("Generating config");
-  const freePort = await findFreePort(DEFAULT_PORT);
-  const rawConfig = generateConfigFromUrl({
-    parsed,
-    repoPath: targetDir,
-    port: freePort ?? DEFAULT_PORT,
+  await runInteractiveCommand("git", ["clone", "--depth", "1", parsed.cloneUrl, targetDir], {
+    cwd,
+    action: "clone repository via git (https)",
   });
-
-  const yamlContent = configToYaml(rawConfig);
-  writeFileSync(configPath, yamlContent);
-  spinner.succeed(`Config generated: ${configPath}`);
-
-  return { config: loadConfig(configPath), parsed, autoGenerated: true };
 }
 
 /**
@@ -530,11 +467,20 @@ async function handleUrlStart(
  * Detects environment, project type, and generates config with smart defaults.
  * Returns the loaded config.
  */
-async function autoCreateConfig(workingDir: string): Promise<OrchestratorConfig> {
+export async function autoCreateConfig(workingDir: string): Promise<OrchestratorConfig> {
   console.log(chalk.bold.cyan("\n  Agent Orchestrator — First Run Setup\n"));
   console.log(chalk.dim("  Detecting project and generating config...\n"));
 
   const env = await detectEnvironment(workingDir);
+
+  if (!env.isGitRepo) {
+    throw new Error(
+      `"${workingDir}" is not a git repository.\n` +
+        `  ao requires a git repo to manage worktrees and branches.\n` +
+        `  Run \`git init\` first, then try again.`,
+    );
+  }
+
   const projectType = detectProjectType(workingDir);
 
   // Show detection results
@@ -561,10 +507,28 @@ async function autoCreateConfig(workingDir: string): Promise<OrchestratorConfig>
   const agentRules = generateRulesFromTemplates(projectType);
 
   // Build config with smart defaults
-  const projectId = env.isGitRepo ? basename(workingDir) : "my-project";
-  const repo = env.ownerRepo || "owner/repo";
-  const path = env.isGitRepo ? workingDir : `~/${projectId}`;
+  const projectId = basename(workingDir);
+  let repo: string | undefined = env.ownerRepo ?? undefined;
+  const path = workingDir;
   const defaultBranch = env.defaultBranch || "main";
+
+  // If no repo detected, inform the user and ask
+  /* c8 ignore start -- interactive prompt, tested via onboarding integration */
+  if (!repo && isHumanCaller()) {
+    console.log(chalk.yellow("  ⚠ Could not auto-detect a GitHub/GitLab remote."));
+    const entered = await promptText(
+      "  Enter repo (owner/repo or group/subgroup/repo) or leave empty to skip:",
+      "owner/repo",
+    );
+    const trimmed = (entered || "").trim();
+    if (trimmed && isValidRepoString(trimmed)) {
+      repo = trimmed;
+      console.log(chalk.green(`  ✓ Repo: ${repo}`));
+    } else if (trimmed) {
+      console.log(chalk.yellow(`  ⚠ "${trimmed}" doesn't look like a valid repo path — skipping.`));
+    }
+  }
+  /* c8 ignore stop */
 
   // Detect available agent runtimes via plugin registry
   let detectedAgents = await detectAvailableAgents();
@@ -580,7 +544,7 @@ async function autoCreateConfig(workingDir: string): Promise<OrchestratorConfig>
   const config: Record<string, unknown> = {
     port: port ?? DEFAULT_PORT,
     defaults: {
-      runtime: "tmux",
+      runtime: getDefaultRuntime(),
       agent,
       workspace: "worktree",
       notifiers: [],
@@ -589,7 +553,7 @@ async function autoCreateConfig(workingDir: string): Promise<OrchestratorConfig>
       [projectId]: {
         name: projectId,
         sessionPrefix: generateSessionPrefix(projectId),
-        repo,
+        ...(repo ? { repo } : {}),
         path,
         defaultBranch,
         ...(agentRules ? { agentRules } : {}),
@@ -603,21 +567,38 @@ async function autoCreateConfig(workingDir: string): Promise<OrchestratorConfig>
     console.log(chalk.dim("  Use 'ao start' to start with the existing config.\n"));
     return loadConfig(outputPath);
   }
-  const yamlContent = yamlStringify(config, { indent: 2 });
+  const yamlContent = configToYaml(config);
   writeFileSync(outputPath, yamlContent);
 
   console.log(chalk.green(`✓ Config created: ${outputPath}\n`));
 
-  if (repo === "owner/repo") {
-    console.log(chalk.yellow("⚠ Could not detect GitHub remote."));
-    console.log(chalk.dim("  Update the 'repo' field in the config before spawning agents.\n"));
+  try {
+    const registeredProjectId = registerProjectInGlobalConfig(projectId, projectId, path, {
+      ...(repo ? { repo } : {}),
+      defaultBranch,
+      sessionPrefix: generateSessionPrefix(projectId),
+    });
+    console.log(chalk.green(`✓ Registered "${registeredProjectId}" in global config\n`));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.log(chalk.yellow("⚠ Could not register project in global config."));
+    console.log(chalk.dim(`  ${message}\n`));
   }
 
-  if (!env.hasTmux) {
+  if (!repo) {
+    console.log(
+      chalk.yellow("⚠ No repo configured — issue tracking and PR features will be unavailable."),
+    );
+    console.log(chalk.dim("  Add a 'repo' field (owner/repo) to the config to enable them.\n"));
+  }
+
+  if (!env.hasTmux && getDefaultRuntime() === "tmux") {
     console.log(chalk.yellow("⚠ tmux not found — will prompt to install at startup"));
   }
   if (!env.hasGh) {
-    console.log(chalk.yellow("⚠ GitHub CLI (gh) not found — optional, but recommended for GitHub workflows."));
+    console.log(
+      chalk.yellow("⚠ GitHub CLI (gh) not found — optional, but recommended for GitHub workflows."),
+    );
     const shouldInstallGh = await askYesNo("Install GitHub CLI now?", false);
     if (shouldInstallGh) {
       const installedGh = await tryInstallWithAttempts(
@@ -648,9 +629,28 @@ async function addProjectToConfig(
   config: OrchestratorConfig,
   projectPath: string,
 ): Promise<string> {
+  const resolvedPath = resolve(projectPath.replace(/^~/, process.env["HOME"] || ""));
+
+  // Check if this path is already registered under any project name.
+  // pathsEqual canonicalizes via realpathSync and lowercases on Windows so
+  // drive-letter case and 8.3-vs-long-name differences don't cause a miss.
+  // Done before ensureGit so already-registered paths return early without requiring git.
+  const existingByPath = Object.entries(config.projects).find(([, p]) => {
+    try {
+      return pathsEqual(p.path, resolvedPath);
+    } catch {
+      return false;
+    }
+  });
+  if (existingByPath) {
+    console.log(
+      chalk.dim(`  Path already configured as project "${existingByPath[0]}" — skipping add.`),
+    );
+    return existingByPath[0];
+  }
+
   await ensureGit("adding projects");
 
-  const resolvedPath = resolve(projectPath.replace(/^~/, process.env["HOME"] || ""));
   let projectId = basename(resolvedPath);
 
   // Avoid overwriting an existing project with the same directory name
@@ -658,7 +658,9 @@ async function addProjectToConfig(
     let i = 2;
     while (config.projects[`${projectId}-${i}`]) i++;
     const newId = `${projectId}-${i}`;
-    console.log(chalk.yellow(`  ⚠ Project "${projectId}" already exists — using "${newId}" instead.`));
+    console.log(
+      chalk.yellow(`  ⚠ Project "${projectId}" already exists — using "${newId}" instead.`),
+    );
     projectId = newId;
   }
 
@@ -674,9 +676,26 @@ async function addProjectToConfig(
   let ownerRepo: string | null = null;
   const gitRemote = await git(["remote", "get-url", "origin"], resolvedPath);
   if (gitRemote) {
-    const match = gitRemote.match(/github\.com[:/]([^/]+\/[^/]+?)(\.git)?$/);
-    if (match) ownerRepo = match[1];
+    ownerRepo = extractOwnerRepo(gitRemote);
   }
+
+  // If no repo detected, prompt the user (same as autoCreateConfig)
+  /* c8 ignore start -- interactive prompt */
+  if (!ownerRepo && isHumanCaller()) {
+    console.log(chalk.yellow("  ⚠ Could not auto-detect a GitHub/GitLab remote."));
+    const entered = await promptText(
+      "  Enter repo (owner/repo or group/subgroup/repo) or leave empty to skip:",
+      "owner/repo",
+    );
+    const trimmed = (entered || "").trim();
+    if (trimmed && isValidRepoString(trimmed)) {
+      ownerRepo = trimmed;
+      console.log(chalk.green(`  ✓ Repo: ${ownerRepo}`));
+    } else if (trimmed) {
+      console.log(chalk.yellow(`  ⚠ "${trimmed}" doesn't look like a valid repo path — skipping.`));
+    }
+  }
+  /* c8 ignore stop */
 
   const defaultBranch = await detectDefaultBranch(resolvedPath, ownerRepo);
 
@@ -713,37 +732,46 @@ async function addProjectToConfig(
     });
   }
 
-  // Load raw YAML, append project, rewrite
-  const rawYaml = readFileSync(config.configPath, "utf-8");
-  const rawConfig = yamlParse(rawYaml);
-  if (!rawConfig.projects) rawConfig.projects = {};
+  if (isCanonicalGlobalConfigPath(config.configPath)) {
+    const registeredProjectId = registerProjectInGlobalConfig(
+      projectId,
+      projectId,
+      resolvedPath,
+      { defaultBranch, sessionPrefix: prefix },
+      config.configPath,
+    );
 
-  rawConfig.projects[projectId] = {
-    name: projectId,
-    repo: ownerRepo || "owner/repo",
-    path: resolvedPath,
-    defaultBranch,
-    sessionPrefix: prefix,
-    ...(agentRules ? { agentRules } : {}),
-  };
+    writeProjectBehaviorConfig(resolvedPath, agentRules ? { agentRules } : {});
 
-  writeFileSync(config.configPath, yamlStringify(rawConfig, { indent: 2 }));
-  console.log(chalk.green(`\n✓ Added "${projectId}" to ${config.configPath}\n`));
+    console.log(chalk.green(`\n✓ Added "${registeredProjectId}" to ${config.configPath}\n`));
+    return registeredProjectId;
+  } else {
+    // Load raw YAML, append project, rewrite
+    const rawYaml = readFileSync(config.configPath, "utf-8");
+    const rawConfig = yamlParse(rawYaml);
+    if (!rawConfig.projects) rawConfig.projects = {};
+
+    rawConfig.projects[projectId] = {
+      name: projectId,
+      ...(ownerRepo ? { repo: ownerRepo } : {}),
+      path: resolvedPath,
+      defaultBranch,
+      sessionPrefix: prefix,
+      ...(agentRules ? { agentRules } : {}),
+    };
+
+    writeFileSync(config.configPath, configToYaml(rawConfig as Record<string, unknown>));
+    console.log(chalk.green(`\n✓ Added "${projectId}" to ${config.configPath}\n`));
+  }
 
   if (!ownerRepo) {
-    console.log(chalk.yellow("⚠ Could not detect GitHub remote."));
-    console.log(chalk.dim("  Update the 'repo' field in the config before spawning agents.\n"));
+    console.log(
+      chalk.yellow("⚠ No repo configured — issue tracking and PR features will be unavailable."),
+    );
+    console.log(chalk.dim("  Add a 'repo' field (owner/repo) to the config to enable them.\n"));
   }
 
   return projectId;
-}
-
-/**
- * Create config without starting dashboard/orchestrator.
- * Used by deprecated `ao init` wrapper.
- */
-export async function createConfigOnly(): Promise<void> {
-  await autoCreateConfig(cwd());
 }
 
 /**
@@ -776,7 +804,7 @@ async function startDashboard(
     child = spawn("pnpm", ["run", "dev"], {
       cwd: webDir,
       stdio: "inherit",
-      detached: false,
+      detached: !isWindows(),
       env,
     });
   } else {
@@ -789,7 +817,7 @@ async function startDashboard(
     child = spawn("node", [startScript], {
       cwd: webDir,
       stdio: "inherit",
-      detached: false,
+      detached: !isWindows(),
       env,
     });
   }
@@ -813,99 +841,6 @@ async function startDashboard(
 /* c8 ignore stop */
 
 /**
- * Ensure tmux is available — interactive install with user consent if missing.
- * Called from runStartup() so ALL ao start
- * paths (normal, URL, retry with existing config) are covered.
- */
-function tmuxInstallAttempts(): InstallAttempt[] {
-  if (process.platform === "darwin") {
-    return [{ cmd: "brew", args: ["install", "tmux"], label: "brew install tmux" }];
-  }
-  if (process.platform === "linux") {
-    return [
-      { cmd: "sudo", args: ["apt-get", "install", "-y", "tmux"], label: "sudo apt-get install -y tmux" },
-      { cmd: "sudo", args: ["dnf", "install", "-y", "tmux"], label: "sudo dnf install -y tmux" },
-    ];
-  }
-  return [];
-}
-
-function tmuxInstallHints(): string[] {
-  if (process.platform === "darwin") return ["brew install tmux"];
-  if (process.platform === "win32") return [
-    "# Install WSL first, then inside WSL:",
-    "sudo apt install tmux",
-  ];
-  return [
-    "sudo apt install tmux      # Debian/Ubuntu",
-    "sudo dnf install tmux      # Fedora/RHEL",
-  ];
-}
-
-async function ensureTmux(): Promise<void> {
-  const hasTmux = (await execSilent("tmux", ["-V"])) !== null;
-  if (hasTmux) return;
-
-  console.log(chalk.yellow("⚠ tmux is required for runtime \"tmux\"."));
-  const shouldInstall = await askYesNo("Install tmux now?", true, false);
-  if (shouldInstall) {
-    const installed = await tryInstallWithAttempts(
-      tmuxInstallAttempts(),
-      async () => (await execSilent("tmux", ["-V"])) !== null,
-    );
-    if (installed) {
-      console.log(chalk.green("  ✓ tmux installed successfully"));
-      return;
-    }
-  }
-
-  console.error(chalk.red("\n✗ tmux is required but is not installed.\n"));
-  console.log(chalk.bold("  Install tmux manually, then re-run ao start:\n"));
-  for (const hint of tmuxInstallHints()) {
-    console.log(chalk.cyan(`    ${hint}`));
-  }
-  console.log();
-  process.exit(1);
-}
-
-async function warnAboutOpenClawStatus(config: OrchestratorConfig): Promise<void> {
-  const openclawConfig = config.notifiers?.["openclaw"];
-  const openclawConfigured =
-    openclawConfig !== null && openclawConfig !== undefined &&
-    typeof openclawConfig === "object" &&
-    openclawConfig.plugin === "openclaw";
-  const configuredUrl =
-    openclawConfigured && typeof openclawConfig.url === "string" ? openclawConfig.url : undefined;
-
-  try {
-    const installation = configuredUrl
-      ? await detectOpenClawInstallation(configuredUrl)
-      : await detectOpenClawInstallation();
-
-    if (openclawConfigured) {
-      if (installation.state !== "running") {
-        console.log(
-          chalk.yellow(
-            `⚠ OpenClaw is configured but the gateway is not reachable at ${installation.gatewayUrl}. Notifications may fail until it is running.`,
-          ),
-        );
-      }
-      return;
-    }
-
-    if (installation.state === "running") {
-      console.log(
-        chalk.yellow(
-          `⚠ OpenClaw is running at ${installation.gatewayUrl} but AO is not configured to use it. Run \`ao setup openclaw\` if you want OpenClaw notifications.`,
-        ),
-      );
-    }
-  } catch {
-    // OpenClaw probing is advisory for `ao start`; never block startup on it.
-  }
-}
-
-/**
  * Shared startup logic: launch dashboard + orchestrator session, print summary.
  * Used by both normal and URL-based start flows.
  */
@@ -915,54 +850,24 @@ async function runStartup(
   project: ProjectConfig,
   opts?: { dashboard?: boolean; orchestrator?: boolean; rebuild?: boolean; dev?: boolean },
 ): Promise<number> {
-  // Ensure tmux is available before doing anything — covers all entry paths
-  // (normal start, URL start, retry with existing config)
-  const runtime = config.defaults?.runtime ?? "tmux";
-  if (runtime === "tmux") {
-    await ensureTmux();
-  }
-  await warnAboutOpenClawStatus(config);
+  await runtimePreflight(config);
 
-  // Prevent macOS idle sleep while AO is running (if enabled in config)
-  // Uses caffeinate -i -w <pid> to hold an assertion tied to this process lifetime.
-  // No-op on non-macOS platforms.
-  if (config.power?.preventIdleSleep !== false) {
-    const sleepHandle = preventIdleSleep();
-    if (sleepHandle) {
-      console.log(chalk.dim("  Preventing macOS idle sleep while AO is running"));
-    }
-  }
+  // Ask about the auto-update channel once on first `ao start` after this
+  // feature ships. No-op on subsequent runs (idempotent — guarded by the
+  // presence of `updateChannel` in the global config).
+  await maybePromptForUpdateChannel();
 
-  // Only inject OpenClaw credentials when the project actually uses OpenClaw.
-  // This avoids exposing API keys to projects/plugins that don't need them.
-  const openclawNotifier = config.notifiers?.["openclaw"];
-  const hasOpenClaw =
-    openclawNotifier !== null && openclawNotifier !== undefined &&
-    typeof openclawNotifier === "object" && openclawNotifier.plugin === "openclaw";
-  if (hasOpenClaw) {
-    const injectedKeys = applyOpenClawCredentials();
-    if (injectedKeys.length > 0) {
-      const names = injectedKeys.map((k) => k.key).join(", ");
-      console.log(chalk.dim(`  Resolved from OpenClaw config: ${names}`));
-    }
-  }
-
-  const sessionId = `${project.sessionPrefix}-orchestrator`;
   const shouldStartLifecycle = opts?.dashboard !== false || opts?.orchestrator !== false;
-  let lifecycleStatus: Awaited<ReturnType<typeof ensureLifecycleWorker>> | null = null;
   let port = config.port ?? DEFAULT_PORT;
-  const orchestratorSessionStrategy = normalizeOrchestratorSessionStrategy(
-    project.orchestratorSessionStrategy,
-  );
-
   console.log(chalk.bold(`\nStarting orchestrator for ${chalk.cyan(project.name)}\n`));
 
   const spinner = ora();
   let dashboardProcess: ChildProcess | null = null;
-  let reused = false;
+  let restored = false;
 
   // Start dashboard (unless --no-dashboard)
   if (opts?.dashboard !== false) {
+    const requestedDashboardPort = port;
     if (!(await isPortAvailable(port))) {
       const newPort = await findFreePort(port + 1);
       if (newPort === null) {
@@ -980,9 +885,12 @@ async function runStartup(
     const isMonorepo = existsSync(resolve(webDir, "server"));
     const willUseDevServer = isMonorepo && opts?.dev === true;
     if (opts?.rebuild) {
-      await rebuildDashboardProductionArtifacts(webDir);
+      await rebuildDashboardProductionArtifacts(webDir, [
+        ...new Set([requestedDashboardPort, port]),
+      ]);
     } else if (!willUseDevServer) {
       await preflight.checkBuilt(webDir);
+      await clearStaleCacheIfNeeded(webDir);
     }
 
     spinner.start("Starting dashboard");
@@ -998,97 +906,175 @@ async function runStartup(
     console.log(chalk.dim("  (Dashboard will be ready in a few seconds)\n"));
   }
 
-  if (shouldStartLifecycle) {
-    try {
-      spinner.start("Starting lifecycle worker");
-      lifecycleStatus = await ensureLifecycleWorker(config, projectId);
-      spinner.succeed(
-        lifecycleStatus.started
-          ? "Lifecycle polling started"
-          : "Lifecycle polling already running",
-      );
-    } catch (err) {
-      spinner.fail("Lifecycle worker failed to start");
-      if (dashboardProcess) {
-        dashboardProcess.kill();
-      }
-      throw new Error(
-        `Failed to start lifecycle worker: ${err instanceof Error ? err.message : String(err)}`,
-        { cause: err },
-      );
-    }
-  }
-
-  // Create orchestrator session (unless --no-orchestrator or existing orchestrators found)
-  let hasExistingOrchestrators = false;
   let selectedOrchestratorId: string | null = null;
 
   if (opts?.orchestrator !== false) {
     const sm = await getSessionManager(config);
 
-    // Check for existing orchestrator sessions for this project
-    let allSessions;
     try {
-      allSessions = await sm.list(projectId);
+      spinner.start("Ensuring orchestrator session");
+      const systemPrompt = generateOrchestratorPrompt({ config, projectId, project });
+      const before = await sm.get(getOrchestratorSessionId(project));
+      const session = await sm.ensureOrchestrator({ projectId, systemPrompt });
+      selectedOrchestratorId = session.id;
+      restored = Boolean(session.restoredAt);
+      if (before && session.id === before.id && !restored) {
+        spinner.succeed(`Using orchestrator session: ${session.id}`);
+      } else if (restored) {
+        spinner.succeed(`Restored orchestrator session: ${session.id}`);
+      } else {
+        spinner.succeed(`Orchestrator session ready: ${session.id}`);
+      }
     } catch (err) {
-      spinner.fail("Failed to list sessions");
+      spinner.fail("Orchestrator setup failed");
       if (dashboardProcess) {
         dashboardProcess.kill();
       }
       throw new Error(
-        `Failed to list sessions: ${err instanceof Error ? err.message : String(err)}`,
+        `Failed to setup orchestrator: ${err instanceof Error ? err.message : String(err)}`,
         { cause: err },
       );
     }
-    const allSessionPrefixes = Object.entries(config.projects).map(
-      ([, p]) => p.sessionPrefix ?? generateSessionPrefix(p.name ?? ""),
-    );
-    const existingOrchestrators = allSessions.filter(
-      (s) =>
-        isOrchestratorSession(s, project.sessionPrefix ?? projectId, allSessionPrefixes) &&
-        !isTerminalSession(s),
-    );
+  }
 
-    if (existingOrchestrators.length > 0) {
-      // Existing orchestrators found — always auto-select the most recently active one.
-      // With a single orchestrator, navigate directly to its session page.
-      // With multiple orchestrators, keep the selection page so the user can choose or spawn a
-      // new one — the dashboard only links to one orchestrator per project, so the selection page
-      // is the only startup path for multi-orchestrator projects.
-      const sortedOrchestrators = [...existingOrchestrators].sort(
-        (a, b) => (b.lastActivityAt?.getTime() ?? 0) - (a.lastActivityAt?.getTime() ?? 0),
-      );
-      const selected = sortedOrchestrators[0];
-      selectedOrchestratorId = selected.id;
-      if (opts?.dashboard !== false && existingOrchestrators.length > 1) {
-        hasExistingOrchestrators = true;
+  if (shouldStartLifecycle) {
+    try {
+      spinner.start("Starting project supervisor");
+      await startProjectSupervisor();
+      spinner.succeed("Lifecycle project supervisor started");
+    } catch (err) {
+      spinner.fail("Project supervisor failed to start");
+      if (dashboardProcess) {
+        dashboardProcess.kill();
       }
-      spinner.succeed(
-        `Using existing orchestrator session: ${selected.id}` +
-          (existingOrchestrators.length > 1
-            ? ` (${existingOrchestrators.length - 1} other session(s) available)` : ""),
+      throw new Error(
+        `Failed to start project supervisor: ${err instanceof Error ? err.message : String(err)}`,
+        { cause: err },
       );
-    } else {
-      // No existing orchestrators — spawn a new one
-      try {
-        spinner.start("Creating orchestrator session");
-        const systemPrompt = generateOrchestratorPrompt({ config, projectId, project });
-        const session = await sm.spawnOrchestrator({ projectId, systemPrompt });
-        selectedOrchestratorId = session.id;
-        reused =
-          orchestratorSessionStrategy === "reuse" &&
-          session.metadata?.["orchestratorSessionReused"] === "true";
-        spinner.succeed(reused ? "Orchestrator session reused" : "Orchestrator session created");
-      } catch (err) {
-        spinner.fail("Orchestrator setup failed");
-        if (dashboardProcess) {
-          dashboardProcess.kill();
+    }
+  }
+
+  // Check for sessions from last `ao stop` and offer to restore them
+  if (isHumanCaller()) {
+    try {
+      const lastStop = await readLastStop();
+      if (lastStop && lastStop.sessionIds.length > 0) {
+        const stoppedAgo = `stopped at ${new Date(lastStop.stoppedAt).toLocaleString()}`;
+        const otherProjects = lastStop.otherProjects ?? [];
+
+        // Build flat list of all sessions to restore, grouped for display
+        const allRestoreSessions: string[] = [
+          ...(lastStop.projectId === projectId ? lastStop.sessionIds : []),
+          ...otherProjects.flatMap((p) => p.sessionIds),
+        ];
+
+        // Display grouped by project
+        const currentProjectSessions = lastStop.projectId === projectId ? lastStop.sessionIds : [];
+        if (currentProjectSessions.length > 0) {
+          console.log(
+            chalk.yellow(
+              `\n  ${currentProjectSessions.length} session(s) were active before last ao stop (${stoppedAgo}):`,
+            ),
+          );
+          console.log(chalk.dim(`  ${currentProjectSessions.join(", ")}\n`));
         }
-        throw new Error(
-          `Failed to setup orchestrator: ${err instanceof Error ? err.message : String(err)}`,
-          { cause: err },
-        );
+        if (otherProjects.length > 0) {
+          const otherTotal = otherProjects.reduce((sum, p) => sum + p.sessionIds.length, 0);
+          console.log(
+            chalk.yellow(`  ${otherTotal} session(s) from other projects were also stopped:`),
+          );
+          for (const p of otherProjects) {
+            console.log(chalk.dim(`  ${p.projectId}: ${p.sessionIds.join(", ")}`));
+          }
+          console.log();
+        }
+
+        if (allRestoreSessions.length > 0) {
+          const shouldRestore = await promptConfirm("Restore these sessions?", true);
+          if (shouldRestore) {
+            // Use global config so the session manager can see all projects
+            let restoreConfig = config;
+            if (otherProjects.length > 0) {
+              const globalPath = getGlobalConfigPath();
+              if (existsSync(globalPath)) {
+                restoreConfig = loadConfig(globalPath);
+              }
+            }
+            const sm = await getSessionManager(restoreConfig);
+            const restoreSpinner = ora(`Restoring ${allRestoreSessions.length} session(s)`).start();
+            let restoredCount = 0;
+            const failedSessionIds = new Set<string>();
+            const warnings: string[] = [];
+            for (const sessionId of allRestoreSessions) {
+              // Skip the orchestrator — it was already restored by ensureOrchestrator above
+              if (selectedOrchestratorId && sessionId === selectedOrchestratorId) {
+                restoredCount++;
+                continue;
+              }
+              try {
+                await sm.restore(sessionId);
+                restoredCount++;
+              } catch (err) {
+                failedSessionIds.add(sessionId);
+                warnings.push(
+                  `  Warning: could not restore ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
+                );
+              }
+            }
+            if (restoredCount === allRestoreSessions.length) {
+              restoreSpinner.succeed(
+                `Restored ${restoredCount}/${allRestoreSessions.length} session(s)`,
+              );
+            } else {
+              restoreSpinner.warn(
+                `Restored ${restoredCount}/${allRestoreSessions.length} session(s)`,
+              );
+            }
+            for (const w of warnings) {
+              console.log(chalk.yellow(w));
+            }
+
+            // Preserve restore state for sessions that failed (transient
+            // workspace/runtime errors). Without this, a single failure on
+            // the first `ao start` would erase the only persisted record
+            // and the remaining sessions would never be retryable. When
+            // every session restored (or was skipped), clear the file.
+            if (failedSessionIds.size > 0) {
+              const remainingTarget = lastStop.sessionIds.filter((id) => failedSessionIds.has(id));
+              const remainingOther = otherProjects
+                .map((p) => ({
+                  projectId: p.projectId,
+                  sessionIds: p.sessionIds.filter((id) => failedSessionIds.has(id)),
+                }))
+                .filter((p) => p.sessionIds.length > 0);
+              if (remainingTarget.length > 0 || remainingOther.length > 0) {
+                await writeLastStop({
+                  stoppedAt: lastStop.stoppedAt,
+                  projectId: lastStop.projectId,
+                  sessionIds: remainingTarget,
+                  ...(remainingOther.length > 0 ? { otherProjects: remainingOther } : {}),
+                });
+                console.log(
+                  chalk.dim(
+                    `  Kept ${failedSessionIds.size} session(s) in last-stop record for retry on next ao start.\n`,
+                  ),
+                );
+              } else {
+                await clearLastStop();
+              }
+            } else {
+              await clearLastStop();
+            }
+          } else {
+            // User declined restore — clear the record.
+            await clearLastStop();
+          }
+        } else {
+          await clearLastStop();
+        }
       }
+    } catch {
+      // Non-fatal: don't block startup if last-stop handling fails
     }
   }
 
@@ -1099,53 +1085,71 @@ async function runStartup(
     console.log(chalk.cyan("Dashboard:"), `http://localhost:${port}`);
   }
 
-  if (shouldStartLifecycle && lifecycleStatus) {
-    const lifecycleLabel = lifecycleStatus.started ? "started" : "already running";
-    console.log(chalk.cyan("Lifecycle:"), lifecycleLabel);
+  if (shouldStartLifecycle) {
+    const supervisedProjects = listLifecycleWorkers().sort();
+    const projectSummary =
+      supervisedProjects.length > 0 ? `: ${supervisedProjects.join(", ")}` : "";
+    console.log(
+      chalk.cyan("Lifecycle:"),
+      `supervised (polling ${supervisedProjects.length} project(s)${projectSummary})`,
+    );
   }
 
-  if (hasExistingOrchestrators) {
-    console.log(
-      chalk.cyan("Orchestrator:"),
-      "multiple sessions found — select one in the dashboard",
-    );
-  } else if (opts?.orchestrator !== false && !reused) {
-    const orchSessionId = selectedOrchestratorId ?? sessionId;
-    if (opts?.dashboard !== false) {
-      console.log(
-        chalk.cyan("Orchestrator:"),
-        `http://localhost:${port}/sessions/${orchSessionId}`,
-      );
-    } else {
-      console.log(
-        chalk.cyan("Orchestrator:"),
-        `ao session attach ${orchSessionId}`,
-      );
-    }
-  } else if (reused) {
-    console.log(chalk.cyan("Orchestrator:"), `reused existing session (${sessionId})`);
+  if (opts?.orchestrator !== false && selectedOrchestratorId) {
+    const restoreNote = restored ? " (restored)" : "";
+    const target =
+      opts?.dashboard !== false
+        ? projectSessionUrl(port, projectId, selectedOrchestratorId)
+        : `ao session attach ${selectedOrchestratorId}`;
+
+    console.log(chalk.cyan("Orchestrator:"), `${target}${restoreNote}`);
   }
 
   console.log(chalk.dim(`Config: ${config.configPath}`));
 
   // Auto-open browser once the server is ready.
-  // With a single orchestrator (or a newly created one), navigate directly to the session page.
-  // With multiple existing orchestrators, open the selection page so the user can choose or
-  // spawn a new one — the dashboard only links one orchestrator per project.
+  // Navigate directly to the deterministic main orchestrator when one is available.
   // Polls the port instead of using a fixed delay — deterministic and works regardless of
   // how long Next.js takes to compile. AbortController cancels polling on early exit.
   let openAbort: AbortController | undefined;
   if (opts?.dashboard !== false) {
     openAbort = new AbortController();
-    const orchestratorUrl = hasExistingOrchestrators
-      ? `http://localhost:${port}/orchestrators?project=${projectId}`
-      : `http://localhost:${port}/sessions/${selectedOrchestratorId ?? sessionId}`;
+    const orchestratorUrl = selectedOrchestratorId
+      ? projectSessionUrl(port, projectId, selectedOrchestratorId)
+      : `http://localhost:${port}`;
     void waitForPortAndOpen(port, orchestratorUrl, openAbort.signal);
   }
 
   // Keep dashboard process alive if it was started
   if (dashboardProcess) {
+    const pid = dashboardProcess.pid;
+
+    // On Unix the dashboard is spawned with detached:true (own process group)
+    // so Ctrl+C only reaches AO's process group, not the dashboard's. Forward
+    // SIGINT/SIGTERM so the dashboard group is also cleaned up on exit.
+    // On Windows, detached:false keeps child in the same console —
+    // Ctrl+C reaches both processes. No signal forwarding needed.
+    if (!isWindows() && pid) {
+      forwardSignalsToChild(pid, dashboardProcess);
+    }
+
+    // Also kill the dashboard child when the parent exits for any reason
+    // (normal exit path after lifecycle flush). The `exit` event is
+    // synchronous and fires regardless of platform, so it covers the cases
+    // where forwardSignalsToChild doesn't (Windows, or non-signal exits).
+    /* c8 ignore start -- exit handler only fires on process termination */
+    const killDashboardChild = (): void => {
+      try {
+        dashboardProcess?.kill("SIGTERM");
+      } catch {
+        // already dead
+      }
+    };
+    /* c8 ignore stop */
+    process.on("exit", killDashboardChild);
+
     dashboardProcess.on("exit", (code) => {
+      process.removeListener("exit", killDashboardChild);
       if (openAbort) openAbort.abort();
       if (code !== 0 && code !== null) {
         console.error(chalk.red(`Dashboard exited with code ${code}`));
@@ -1159,27 +1163,130 @@ async function runStartup(
 
 /**
  * Stop dashboard server.
- * Uses lsof to find the process listening on the port, then kills it.
+ * Uses platform adapter to find the process listening on the port, then kills it.
  * Best effort — if it fails, just warn the user.
  */
-async function stopDashboard(port: number): Promise<void> {
-  try {
-    // Find PIDs listening on the port (can be multiple: parent + children)
-    const { stdout } = await exec("lsof", ["-ti", `:${port}`]);
-    const pids = stdout
-      .trim()
-      .split("\n")
-      .filter((p) => p.length > 0);
+/** Pattern matching AO dashboard processes (production and dev mode). */
+const DASHBOARD_CMD_PATTERN = /next-server|start-all\.js|next dev|ao-web/;
 
-    if (pids.length > 0) {
-      // Kill all processes (pass PIDs as separate arguments)
-      await exec("kill", pids);
-      console.log(chalk.green("Dashboard stopped"));
-    } else {
-      console.log(chalk.yellow(`Dashboard not running on port ${port}`));
+/**
+ * Check whether a process listening on the given port is an AO dashboard
+ * (next-server, start-all.js, or next dev).  Only kills matching PIDs,
+ * leaving unrelated co-listeners (sidecars, SO_REUSEPORT) untouched.
+ */
+async function killDashboardOnPort(port: number): Promise<boolean> {
+  try {
+    const pid = await findPidByPort(port);
+    if (!pid) return false;
+
+    // On Unix, verify the process is actually a dashboard before killing so
+    // unrelated co-listeners (sidecars, SO_REUSEPORT) are left untouched.
+    // findPidByPort on Windows uses netstat; we trust the port match there.
+    if (!isWindows()) {
+      try {
+        const { stdout: cmdline } = await exec("ps", ["-p", String(pid), "-o", "args="]);
+        if (!DASHBOARD_CMD_PATTERN.test(cmdline)) return false;
+      } catch {
+        return false;
+      }
     }
+
+    await killProcessTree(Number(pid));
+    return true;
   } catch {
-    console.log(chalk.yellow("Could not stop dashboard (may not be running)"));
+    return false;
+  }
+}
+
+async function stopDashboard(port: number): Promise<void> {
+  // 1. Try the expected port — verify it's a dashboard before killing
+  if (await killDashboardOnPort(port)) {
+    console.log(chalk.green("Dashboard stopped"));
+    return;
+  }
+
+  // 2. Fallback: scan nearby ports to find an orphaned dashboard
+  //    that was auto-reassigned when the original port was busy.
+  //    Uses killDashboardOnPort to verify the process is actually an
+  //    AO dashboard before killing, avoiding collateral damage.
+  for (let p = port + 1; p <= port + MAX_PORT_SCAN; p++) {
+    if (await killDashboardOnPort(p)) {
+      console.log(chalk.green(`Dashboard stopped (was on port ${p})`));
+      return;
+    }
+  }
+
+  console.log(chalk.yellow("Could not stop dashboard (may not be running)"));
+}
+
+/**
+ * Spawn an orchestrator session against an already-running daemon, invalidate
+ * the dashboard's project cache, and surface enough context for the user to
+ * find the new session.
+ *
+ * Replaces the per-arg-shape inline blocks (§3.2 URL/path-while-running and
+ * §3.3 project-id-while-running) that previously each carried their own
+ * messaging + reload + browser-open code. The two flows differ only in which
+ * line of "registered" vs "reattached" they print, driven by `justCreated`.
+ */
+async function attachAndSpawnOrchestrator(opts: {
+  running: RunningState;
+  config: OrchestratorConfig;
+  projectId: string;
+  project: ProjectConfig;
+  /** True when this CLI invocation registered the project for the first
+   *  time (URL clone or path register). Drives the "registered" vs
+   *  "reattached" message line. */
+  justCreated: boolean;
+}): Promise<void> {
+  const { running, config, projectId, project, justCreated } = opts;
+  const daemon = attachToDaemon(running);
+
+  console.log(
+    chalk.dim(
+      justCreated
+        ? "\n  Spawning orchestrator session...\n"
+        : "\n  Attaching to running AO instance...\n",
+    ),
+  );
+
+  const sm = await getSessionManager(config);
+  const systemPrompt = generateOrchestratorPrompt({ config, projectId, project });
+  const session = await sm.ensureOrchestrator({ projectId, systemPrompt });
+
+  if (justCreated) {
+    console.log(chalk.green(`\n✓ Project "${projectId}" registered in the global config.`));
+    console.log(chalk.green(`✓ Orchestrator session ready: ${session.id}`));
+  } else {
+    console.log(chalk.green(`✓ Orchestrator session ready: ${session.id}`));
+    console.log(
+      chalk.green(`✓ Project "${projectId}" reattached to running daemon (PID ${daemon.pid}).`),
+    );
+  }
+
+  const notifyResult = await daemon.notifyProjectChange();
+  if (notifyResult.ok) {
+    console.log(chalk.dim(`  Dashboard config reloaded.`));
+  } else {
+    console.log(
+      chalk.yellow(`  ⚠ ${notifyResult.reason}. Refresh the page if the project doesn't show up.`),
+    );
+  }
+
+  if (!running.projects.includes(projectId)) {
+    console.log(
+      chalk.yellow(
+        `\nℹ Lifecycle polling for "${projectId}" will attach within ~60s\n` +
+          `  because the running ao start process now supervises active global projects.\n`,
+      ),
+    );
+  }
+
+  if (isHumanCaller()) {
+    console.log(chalk.dim(`  Opening dashboard: http://localhost:${daemon.port}\n`));
+    openUrl(`http://localhost:${daemon.port}`);
+  } else {
+    console.log(`Dashboard: http://localhost:${daemon.port}`);
   }
 }
 
@@ -1209,168 +1316,255 @@ export function registerStart(program: Command): void {
           interactive?: boolean;
         },
       ) => {
+        let releaseStartupLock: (() => void) | undefined;
+        let startupLockReleased = false;
+        const unlockStartup = (): void => {
+          if (startupLockReleased || !releaseStartupLock) return;
+          startupLockReleased = true;
+          releaseStartupLock();
+        };
+
         try {
+          releaseStartupLock = await acquireStartupLock();
           let config: OrchestratorConfig;
           let projectId: string;
           let project: ProjectConfig;
 
-          if (projectArg && isRepoUrl(projectArg)) {
-            // ── URL argument: clone + auto-config + start ──
-            console.log(chalk.bold.cyan("\n  Agent Orchestrator — Quick Start\n"));
-            const result = await handleUrlStart(projectArg);
-            config = result.config;
-            ({ projectId, project } = await resolveProjectByRepo(config, result.parsed));
-          } else if (projectArg && isLocalPath(projectArg)) {
-            // ── Path argument: add project if new, then start ──
-            const resolvedPath = resolve(projectArg.replace(/^~/, process.env["HOME"] || ""));
+          // ── Already-running detection (before any config mutation) ──
+          let running = await isAlreadyRunning();
+          let startNewOrchestrator = false;
+          const isProjectId = projectArg && !isRepoUrl(projectArg) && !isLocalPath(projectArg);
+          const projectArgIsUrlOrPath =
+            !!projectArg && (isRepoUrl(projectArg) || isLocalPath(projectArg));
 
-            // Try to load existing config
-            let configPath: string | undefined;
-            try {
-              configPath = findConfigFile() ?? undefined;
-            } catch {
-              // No config found — create one first
-            }
-
-            if (!configPath) {
-              // No config anywhere — auto-create in cwd, then add the path as project
-              config = await autoCreateConfig(cwd());
-              // If the path is different from cwd, add it as a second project
-              if (resolve(cwd()) !== resolvedPath) {
-                const addedId = await addProjectToConfig(config, resolvedPath);
-                config = loadConfig(config.configPath);
-                projectId = addedId;
-                project = config.projects[projectId];
-              } else {
-                ({ projectId, project } = await resolveProject(config));
-              }
-            } else {
-              config = loadConfig(configPath);
-
-              // Check if project is already in config (match by path)
-              const existingEntry = Object.entries(config.projects).find(
-                ([, p]) => resolve(p.path.replace(/^~/, process.env["HOME"] || "")) === resolvedPath,
-              );
-
-              if (existingEntry) {
-                // Already in config — just start it
-                projectId = existingEntry[0];
-                project = existingEntry[1];
-              } else {
-                // New project — add it to config
-                const addedId = await addProjectToConfig(config, resolvedPath);
-                config = loadConfig(config.configPath);
-                projectId = addedId;
-                project = config.projects[projectId];
-              }
-            }
-          } else {
-            // ── No arg or project ID: load config or auto-create ──
-            let loadedConfig: OrchestratorConfig | null = null;
-            try {
-              loadedConfig = loadConfig();
-            } catch (err) {
-              if (err instanceof ConfigNotFoundError) {
-                // First run — auto-create config
-                loadedConfig = await autoCreateConfig(cwd());
-              } else {
-                throw err;
-              }
-            }
-            config = loadedConfig;
-            ({ projectId, project } = await resolveProject(config, projectArg));
-          }
-
-          // ── Already-running detection (Step 9) ──
-          const running = await isAlreadyRunning();
+          // ── Already-running dispatch ──
+          // Whether we attach to a live daemon or spawn a new one, the
+          // project-resolution + orchestrator-spawn steps are the same.
+          // The fork lives in two places: this menu (human caller, no
+          // arg) where the user can quit/open/add-cwd/restart/spawn-new,
+          // and the post-resolve branch below that calls either
+          // attachAndSpawnOrchestrator (running) or runStartup (not).
           if (running) {
-            if (isHumanCaller()) {
+            if (!isHumanCaller() && !isProjectId) {
+              // Non-human caller, no arg or URL/path arg: print info and
+              // exit. Project-id args fall through to attach+spawn so
+              // automation can `ao start <id>` against a live daemon.
+              console.log(`AO is already running.`);
+              console.log(`Dashboard: http://localhost:${running.port}`);
+              console.log(`PID: ${running.pid}`);
+              console.log(`Projects: ${running.projects.join(", ")}`);
+              console.log(`To restart: ao stop && ao start`);
+              unlockStartup();
+              process.exit(0);
+            }
+
+            if (isHumanCaller() && !projectArg) {
               console.log(chalk.cyan(`\nℹ AO is already running.`));
               console.log(`  Dashboard: ${chalk.cyan(`http://localhost:${running.port}`)}`);
               console.log(`  PID: ${running.pid} | Up since: ${running.startedAt}`);
               console.log(`  Projects: ${running.projects.join(", ")}\n`);
 
+              const cwdResolved = resolve(cwd());
+              const cwdIsRegistered = running.projects.some((p) => {
+                try {
+                  const loadedCfg = loadConfig();
+                  const proj = loadedCfg.projects[p];
+                  return proj !== undefined && pathsEqual(proj.path, cwdResolved);
+                } catch {
+                  return false;
+                }
+              });
+              const cwdHasGit = existsSync(resolve(cwdResolved, ".git"));
+              const addCwdOption =
+                !cwdIsRegistered && cwdHasGit
+                  ? [
+                      {
+                        value: "add",
+                        label: `Add ${basename(cwdResolved)}`,
+                        hint: "register this directory and start",
+                      },
+                    ]
+                  : [];
+
               const choice = await promptSelect(
                 "AO is already running. What do you want to do?",
                 [
                   { value: "open", label: "Open dashboard", hint: "Keep the current instance" },
-                  { value: "new", label: "Start new orchestrator", hint: "Add a new session for this project" },
-                  { value: "restart", label: "Restart everything", hint: "Stop the current instance first" },
+                  {
+                    value: "new",
+                    label: "Start new orchestrator",
+                    hint: "Add a new session for this project",
+                  },
+                  ...addCwdOption,
+                  {
+                    value: "restart",
+                    label: "Restart everything",
+                    hint: "Stop the current instance first",
+                  },
                   { value: "quit", label: "Quit" },
                 ],
                 "open",
               );
 
               if (choice === "open") {
-                const url = `http://localhost:${running.port}`;
-                openUrl(url);
+                openUrl(`http://localhost:${running.port}`);
+                unlockStartup();
+                process.exit(0);
+              } else if (choice === "quit") {
+                unlockStartup();
+                process.exit(0);
+              } else if (choice === "add") {
+                // Persist cwd against whatever config loadConfig() walks up
+                // to from the current directory. addProjectToConfig is
+                // canonical-aware: when that config happens to be the global
+                // one (the canonical fallback), the project lands in the
+                // global registry; when it is a cwd-local agent-orchestrator
+                // .yaml, the project is appended there. This matches the
+                // pre-B.2 behavior — the menu's "add" path deliberately does
+                // not spawn an orchestrator session, so the user can review
+                // the registration and start one explicitly via `ao start
+                // <id>` or the "new" menu choice.
+                const loadedCfg = loadConfig();
+                const addedId = await addProjectToConfig(loadedCfg, cwdResolved);
+                console.log(
+                  chalk.green(
+                    `\n✓ Added "${addedId}" — open the dashboard to start an orchestrator.\n`,
+                  ),
+                );
+                const notifyResult = await attachToDaemon(running).notifyProjectChange();
+                if (!notifyResult.ok) {
+                  console.log(
+                    chalk.yellow(
+                      `  ⚠ ${notifyResult.reason}. Refresh the page if the project doesn't show up.`,
+                    ),
+                  );
+                }
+                openUrl(`http://localhost:${running.port}`);
+                unlockStartup();
                 process.exit(0);
               } else if (choice === "new") {
-                // Generate unique orchestrator: same project, new session
-                const rawYaml = readFileSync(config.configPath, "utf-8");
-                const rawConfig = yamlParse(rawYaml);
-
-                // Collect existing prefixes to avoid collisions
-                const existingPrefixes = new Set(
-                  Object.values(rawConfig.projects as Record<string, Record<string, unknown>>).map(
-                    (p) => p.sessionPrefix as string,
-                  ).filter(Boolean),
-                );
-
-                let newId: string;
-                let newPrefix: string;
-                do {
-                  const suffix = Math.random().toString(36).slice(2, 6);
-                  newId = `${projectId}-${suffix}`;
-                  newPrefix = generateSessionPrefix(newId);
-                } while (rawConfig.projects[newId] || existingPrefixes.has(newPrefix));
-
-                rawConfig.projects[newId] = {
-                  ...rawConfig.projects[projectId],
-                  sessionPrefix: newPrefix,
-                };
-                writeFileSync(config.configPath, yamlStringify(rawConfig, { indent: 2 }));
-                console.log(chalk.green(`\n✓ New orchestrator "${newId}" added to config\n`));
-                config = loadConfig(config.configPath);
-                projectId = newId;
-                project = config.projects[newId];
-                // Continue to startup below
+                // Spawn a new orchestrator entry against this daemon.
+                // Resolve happens below; the suffix mutation runs after.
+                startNewOrchestrator = true;
               } else if (choice === "restart") {
-                try { process.kill(running.pid, "SIGTERM"); } catch { /* already dead */ }
-                if (!(await waitForExit(running.pid, 5000))) {
-                  console.log(chalk.yellow("  Process didn't exit cleanly, sending SIGKILL..."));
-                  try { process.kill(running.pid, "SIGKILL"); } catch { /* already dead */ }
-                }
-                await unregister();
+                await killExistingDaemon(running);
                 console.log(chalk.yellow("\n  Stopped existing instance. Restarting...\n"));
-                // Continue to startup below
-              } else {
-                process.exit(0);
+                running = null;
               }
-            } else {
-              // Agent/non-TTY caller — print info and exit
-              console.log(`AO is already running.`);
-              console.log(`Dashboard: http://localhost:${running.port}`);
-              console.log(`PID: ${running.pid}`);
-              console.log(`Projects: ${running.projects.join(", ")}`);
-              console.log(`To restart: ao stop && ao start`);
-              process.exit(0);
             }
           }
 
-          // ── Agent selection prompt (Step 10)──
+          // Unified project resolution. See lib/resolve-project.ts for the
+          // per-arg-shape dispatch (URL / path / project id / cwd). When
+          // a daemon is up, the resolver registers URL clones / new paths
+          // in the global config — the daemon's source of truth — so they
+          // are visible to the project supervisor without a daemon restart.
+          const resolvedProject = await resolveOrCreateProject(
+            projectArg,
+            {
+              addProjectToConfig,
+              autoCreateConfig,
+              resolveProject,
+              resolveProjectByRepo,
+              registerFlatConfig,
+              cloneRepo,
+            },
+            { targetGlobalRegistry: !!running },
+          );
+          ({ config, projectId, project } = resolvedProject);
+
+          // ── Handle "new orchestrator" choice (deferred from already-running check) ──
+          if (startNewOrchestrator) {
+            const rawYaml = readFileSync(config.configPath, "utf-8");
+            const rawConfig = yamlParse(rawYaml);
+
+            // Collect existing prefixes to avoid collisions
+            const existingPrefixes = new Set(
+              Object.values(rawConfig.projects as Record<string, Record<string, unknown>>)
+                .map((p) => p.sessionPrefix as string)
+                .filter(Boolean),
+            );
+
+            let newId: string;
+            let newPrefix: string;
+            do {
+              const suffix = Math.random().toString(36).slice(2, 6);
+              newId = `${projectId}-${suffix}`;
+              newPrefix = generateSessionPrefix(newId);
+            } while (rawConfig.projects[newId] || existingPrefixes.has(newPrefix));
+
+            rawConfig.projects[newId] = {
+              ...rawConfig.projects[projectId],
+              sessionPrefix: newPrefix,
+            };
+            const nextYaml = isCanonicalGlobalConfigPath(config.configPath)
+              ? yamlStringify(rawConfig, { indent: 2 })
+              : configToYaml(rawConfig as Record<string, unknown>);
+            writeFileSync(config.configPath, nextYaml);
+            console.log(chalk.green(`\n✓ New orchestrator "${newId}" added to config\n`));
+            config = loadConfig(config.configPath);
+            projectId = newId;
+            project = config.projects[newId];
+          }
+
+          // ── Daemon-running short-circuit and attach pipeline ──
+          if (running) {
+            // URL/path arg whose project is already registered and supervised
+            // by the running daemon: don't even spawn an orchestrator session,
+            // just open the dashboard. Mirrors the original §3.2 fast path.
+            if (
+              projectArgIsUrlOrPath &&
+              !resolvedProject.justCreated &&
+              running.projects.includes(projectId)
+            ) {
+              console.log(chalk.cyan(`\nℹ AO is already running.`));
+              console.log(`  Dashboard: ${chalk.cyan(`http://localhost:${running.port}`)}`);
+              console.log(`  Project "${projectId}" is already registered and running.\n`);
+              openUrl(`http://localhost:${running.port}`);
+              unlockStartup();
+              process.exit(0);
+            }
+
+            await attachAndSpawnOrchestrator({
+              running,
+              config,
+              projectId,
+              project,
+              justCreated: resolvedProject.justCreated,
+            });
+            unlockStartup();
+            process.exit(0);
+          }
+
+          // ── Agent selection prompt (not-running spawn path only) ──
+          // Skipped when attaching to an existing daemon: changing agents
+          // mid-flight against a live orchestrator session would not take
+          // effect until the next restart anyway.
           const agentOverride = opts?.interactive ? await promptAgentSelection() : null;
           if (agentOverride) {
             const { orchestratorAgent, workerAgent } = agentOverride;
 
-            const rawYaml = readFileSync(config.configPath, "utf-8");
-            const rawConfig = yamlParse(rawYaml);
-            const proj = rawConfig.projects[projectId];
-            proj.orchestrator = { ...(proj.orchestrator ?? {}), agent: orchestratorAgent };
-            proj.worker = { ...(proj.worker ?? {}), agent: workerAgent };
-            writeFileSync(config.configPath, yamlStringify(rawConfig, { indent: 2 }));
-            console.log(chalk.dim(`  ✓ Saved to ${config.configPath}\n`));
-            
+            if (isCanonicalGlobalConfigPath(config.configPath)) {
+              const nextLocalConfig = readProjectBehaviorConfig(project.path);
+              nextLocalConfig.orchestrator = {
+                ...(nextLocalConfig.orchestrator ?? {}),
+                agent: orchestratorAgent,
+              };
+              nextLocalConfig.worker = {
+                ...(nextLocalConfig.worker ?? {}),
+                agent: workerAgent,
+              };
+              writeProjectBehaviorConfig(project.path, nextLocalConfig);
+              console.log(chalk.dim(`  ✓ Saved to ${project.path}/agent-orchestrator.yaml\n`));
+            } else {
+              const rawYaml = readFileSync(config.configPath, "utf-8");
+              const rawConfig = yamlParse(rawYaml);
+              const proj = rawConfig.projects[projectId];
+              proj.orchestrator = { ...(proj.orchestrator ?? {}), agent: orchestratorAgent };
+              proj.worker = { ...(proj.worker ?? {}), agent: workerAgent };
+              writeFileSync(config.configPath, configToYaml(rawConfig as Record<string, unknown>));
+              console.log(chalk.dim(`  ✓ Saved to ${config.configPath}\n`));
+            }
             config = loadConfig(config.configPath);
             project = config.projects[projectId];
           }
@@ -1378,42 +1572,50 @@ export function registerStart(program: Command): void {
           const actualPort = await runStartup(config, projectId, project, opts);
 
           // ── Register in running.json (Step 11) ──
-          // Only record the project this invocation actually polls. Other
-          // configured projects are not covered by this lifecycle loop, and
-          // `ao spawn` relies on this list to decide whether to warn users.
+          // During daemon startup, the project supervisor is the authoritative
+          // writer for lifecycle polling coverage across all active projects.
           await register({
             pid: process.pid,
             configPath: config.configPath,
             port: actualPort,
             startedAt: new Date().toISOString(),
-            projects: [projectId],
+            projects: listLifecycleWorkers(),
+          });
+          unlockStartup();
+
+          // Start the Bun-extracted /tmp/.*.{so,dylib} janitor once per AO
+          // process. Single-instance is enforced by running.json + the
+          // startup lock above, so this call site is reached at most once
+          // per process. The janitor uses an unref'd interval timer, so it
+          // does not keep the event loop alive on its own and dies with the
+          // process on SIGTERM/SIGINT.
+          startBunTmpJanitor({
+            onSweep: ({ removed, freedBytes, errors }) => {
+              if (removed > 0) {
+                console.info(
+                  `[bun-tmp-janitor] reclaimed ${removed} file(s) / ${freedBytes} bytes`,
+                );
+              }
+              if (errors > 0) {
+                console.warn(`[bun-tmp-janitor] sweep had ${errors} error(s)`);
+              }
+            },
           });
 
-          // Install shutdown handlers so `ao stop` (which sends SIGTERM to
-          // this pid) flushes lifecycle health state before exit. Handlers
-          // MUST call process.exit() — installing a SIGINT/SIGTERM listener
-          // removes Node's default exit behavior, so without an explicit
-          // exit the interval timer would keep the event loop alive.
-          let shuttingDown = false;
-          const shutdown = (signal: NodeJS.Signals): void => {
-            if (shuttingDown) return;
-            shuttingDown = true;
-            try {
-              stopAllLifecycleWorkers();
-            } catch {
-              // Best-effort cleanup — never block shutdown on observability.
-            }
-            process.exit(signal === "SIGINT" ? 130 : 0);
-          };
-          process.once("SIGINT", shutdown);
-          process.once("SIGTERM", shutdown);
+          // Ctrl+C and `ao stop` (which sends SIGTERM) perform a full
+          // graceful shutdown: kill sessions, record last-stop state for
+          // restore, unregister, then exit. See lib/shutdown.ts.
+          installShutdownHandlers({ configPath: config.configPath, projectId });
         } catch (err) {
           if (err instanceof Error) {
             console.error(chalk.red("\nError:"), err.message);
           } else {
             console.error(chalk.red("\nError:"), String(err));
           }
+          unlockStartup();
           process.exit(1);
+        } finally {
+          unlockStartup();
         }
       },
     );
@@ -1424,7 +1626,49 @@ export function registerStart(program: Command): void {
  * Paths contain / or ~ or . at the start.
  */
 function isLocalPath(arg: string): boolean {
-  return arg.startsWith("/") || arg.startsWith("~") || arg.startsWith("./") || arg.startsWith("..");
+  if (arg.startsWith("/") || arg.startsWith("~") || arg.startsWith("./") || arg.startsWith("..")) {
+    return true;
+  }
+  // Windows paths: drive-letter (C:\, D:/), UNC (\\server\share), or relative backslash paths.
+  if (/^[A-Za-z]:[\\/]/.test(arg)) return true;
+  if (arg.startsWith("\\\\") || arg.startsWith(".\\") || arg.startsWith("..\\")) return true;
+  return false;
+}
+
+/**
+ * Lazy import + invoke the runtime-process plugin's Windows pty-host sweep.
+ * Kept lazy so non-Windows users don't pay the import cost on every `ao stop`,
+ * and so the cli isn't tightly coupled to the plugin's surface.
+ *
+ * Errors are swallowed: a sweep failure must not prevent `ao stop` from killing
+ * the parent process — the user explicitly asked us to stop AO.
+ */
+async function sweepWindowsPtyHostsBeforeParentKill(): Promise<void> {
+  if (!isWindows()) return;
+  try {
+    const mod = (await import("@aoagents/ao-plugin-runtime-process")) as {
+      sweepWindowsPtyHosts?: () => Promise<{
+        attempted: number;
+        gracefullyExited: number;
+        forceKilled: number;
+        failed: number;
+      }>;
+    };
+    if (typeof mod.sweepWindowsPtyHosts !== "function") return;
+    const result = await mod.sweepWindowsPtyHosts();
+    if (result.attempted > 0) {
+      console.log(
+        chalk.dim(
+          `  Swept ${result.attempted} pty-host(s): ` +
+            `${result.gracefullyExited} graceful, ` +
+            `${result.forceKilled} force-killed` +
+            (result.failed > 0 ? `, ${result.failed} failed` : ""),
+        ),
+      );
+    }
+  } catch {
+    /* sweep is best-effort; don't block ao stop on it */
+  }
 }
 
 export function registerStop(program: Command): void {
@@ -1433,86 +1677,181 @@ export function registerStop(program: Command): void {
     .description("Stop orchestrator agent and dashboard")
     .option("--purge-session", "Delete mapped OpenCode session when stopping")
     .option("--all", "Stop all running AO instances")
-    .action(
-      async (
-        projectArg?: string,
-        opts: { purgeSession?: boolean; all?: boolean } = {},
-      ) => {
-        try {
-          // Check running.json first
-          const running = await getRunning();
+    .action(async (projectArg?: string, opts: { purgeSession?: boolean; all?: boolean } = {}) => {
+      try {
+        // Check running.json first
+        const running = await getRunning();
 
-          if (opts.all) {
-            // --all: kill via running.json if available, then fallback to config
-            if (running) {
-              try {
-                process.kill(running.pid, "SIGTERM");
-              } catch {
-                // Already dead
-              }
-              await unregister();
-              console.log(
-                chalk.green(`\n✓ Stopped AO on port ${running.port}`),
-              );
-              console.log(chalk.dim(`  Projects: ${running.projects.join(", ")}\n`));
-            } else {
-              console.log(chalk.yellow("No running AO instance found in running.json."));
-            }
-            return;
-          }
-
-          const config = loadConfig();
-          const { projectId: _projectId, project } = await resolveProject(config, projectArg, "stop");
-          const sessionId = `${project.sessionPrefix}-orchestrator`;
-          const port = config.port ?? DEFAULT_PORT;
-
-          console.log(chalk.bold(`\nStopping orchestrator for ${chalk.cyan(project.name)}\n`));
-
-          // Kill orchestrator session via SessionManager
-          const sm = await getSessionManager(config);
-          const existing = await sm.get(sessionId);
-
-          if (existing) {
-            const spinner = ora("Stopping orchestrator session").start();
-            const purgeOpenCode = opts?.purgeSession === true;
-            await sm.kill(sessionId, { purgeOpenCode });
-            spinner.succeed("Orchestrator session stopped");
+        if (opts.all) {
+          // --all: kill via running.json if available, then fallback to config
+          if (running) {
+            // Sweep detached Windows pty-hosts BEFORE killing the parent.
+            // detached:true puts them outside the parent's process tree, so
+            // taskkill /T cannot reach them. The sweep speaks the named-pipe
+            // protocol so node-pty disposes ConPTY gracefully (avoids WER
+            // 0x800700e8). No-op on non-Windows.
+            await sweepWindowsPtyHostsBeforeParentKill();
+            // killProcessTree handles process trees on Windows (taskkill /T /F)
+            // and process groups on Unix; it swallows "already dead" internally.
+            await killProcessTree(running.pid, "SIGTERM");
+            await unregister();
+            console.log(chalk.green(`\n✓ Stopped AO on port ${running.port}`));
+            console.log(chalk.dim(`  Projects: ${running.projects.join(", ")}\n`));
           } else {
-            console.log(chalk.yellow(`Orchestrator session "${sessionId}" is not running`));
+            console.log(chalk.yellow("No running AO instance found in running.json."));
+          }
+          return;
+        }
+
+        let config = loadConfig();
+        // ao stop affects all projects (it kills the parent ao start process),
+        // so load the global config which has all registered projects.
+        // When a specific project is targeted, only fall back to global if
+        // the project isn't in the local config.
+        if (!projectArg || !config.projects[projectArg]) {
+          const globalPath = getGlobalConfigPath();
+          if (existsSync(globalPath)) {
+            config = loadConfig(globalPath);
+          }
+        }
+        const { projectId: _projectId, project } = await resolveProject(config, projectArg, "stop");
+        const port = config.port ?? DEFAULT_PORT;
+
+        console.log(chalk.bold(`\nStopping orchestrator for ${chalk.cyan(project.name)}\n`));
+
+        const sm = await getSessionManager(config);
+        try {
+          // When no explicit project is given, list ALL sessions — ao stop
+          // kills the parent process which affects all projects. When a
+          // specific project is targeted, scope to that project only.
+          const stopAll = !projectArg;
+          const rawSessions = await sm.list(stopAll ? undefined : _projectId);
+          // Defensive consumer-side filter. `sm.list(projectId)` already scopes
+          // to the named project, but the kill loop hard-stops processes — a
+          // contract regression here would silently kill another project's
+          // work. When a project arg is given, drop anything that isn't ours.
+          const allSessions = stopAll
+            ? rawSessions
+            : rawSessions.filter((s) => s.projectId === _projectId);
+          const activeSessions = allSessions.filter((s) => !isTerminalSession(s));
+          const killedSessionIds: string[] = [];
+
+          // Separate sessions by project for display and recording
+          const targetActive = activeSessions.filter((s) => s.projectId === _projectId);
+          const otherActive = activeSessions.filter((s) => s.projectId !== _projectId);
+          // Group other-project sessions by projectId (used for display + recording)
+          const otherByProject = new Map<string, string[]>();
+
+          if (activeSessions.length > 0) {
+            const spinner = ora(`Stopping ${activeSessions.length} active session(s)`).start();
+            const purgeOpenCode = opts?.purgeSession === true;
+            const warnings: string[] = [];
+            for (const session of activeSessions) {
+              try {
+                const result = await sm.kill(session.id, { purgeOpenCode });
+                if (result.cleaned || result.alreadyTerminated) {
+                  killedSessionIds.push(session.id);
+                }
+              } catch (err) {
+                warnings.push(
+                  `  Warning: failed to stop ${session.id}: ${err instanceof Error ? err.message : String(err)}`,
+                );
+              }
+            }
+            if (killedSessionIds.length === 0) {
+              spinner.fail("Failed to stop any sessions");
+            } else if (killedSessionIds.length < activeSessions.length) {
+              spinner.warn(
+                `Stopped ${killedSessionIds.length}/${activeSessions.length} session(s)`,
+              );
+            } else {
+              spinner.succeed(`Stopped ${killedSessionIds.length} session(s)`);
+            }
+            for (const w of warnings) {
+              console.log(chalk.yellow(w));
+            }
+            // Show stopped sessions grouped by project
+            const killedTarget = targetActive
+              .filter((s) => killedSessionIds.includes(s.id))
+              .map((s) => s.id);
+            if (killedTarget.length > 0) {
+              console.log(chalk.green(`  ${project.name}: ${killedTarget.join(", ")}`));
+            }
+            for (const s of otherActive) {
+              if (!killedSessionIds.includes(s.id)) continue;
+              const list = otherByProject.get(s.projectId ?? "unknown") ?? [];
+              list.push(s.id);
+              otherByProject.set(s.projectId ?? "unknown", list);
+            }
+            for (const [pid, ids] of otherByProject) {
+              console.log(chalk.green(`  ${pid}: ${ids.join(", ")}`));
+            }
+          } else {
+            console.log(chalk.yellow(`No active sessions found`));
           }
 
+          // Record stopped sessions for restore on next `ao start`
+          if (killedSessionIds.length > 0) {
+            const otherProjects: Array<{ projectId: string; sessionIds: string[] }> = [];
+            for (const [pid, ids] of otherByProject) {
+              otherProjects.push({ projectId: pid, sessionIds: ids });
+            }
+
+            await writeLastStop({
+              stoppedAt: new Date().toISOString(),
+              projectId: _projectId,
+              sessionIds: killedSessionIds.filter((id) => targetActive.some((s) => s.id === id)),
+              otherProjects: otherProjects.length > 0 ? otherProjects : undefined,
+            });
+          }
+        } catch (err) {
+          console.log(
+            chalk.yellow(
+              `  Could not list sessions: ${err instanceof Error ? err.message : String(err)}`,
+            ),
+          );
+        }
+
+        // Only kill the parent `ao start` process and dashboard when stopping
+        // everything (no project arg). When targeting a specific project, the
+        // parent process and dashboard serve all projects and must stay alive.
+        if (!projectArg) {
           // Lifecycle polling runs in-process inside the `ao start` process
           // (registered via `running.json`). Sending SIGTERM to that PID below
           // triggers the shared shutdown handler in `lifecycle-service`, which
           // stops every per-project loop. No explicit stop call needed here —
           // this CLI invocation is a separate process with an empty active map.
-
-          // Stop dashboard — kill parent PID from running.json, then also stop
-          // any dashboard child process via lsof (parent SIGTERM may not propagate)
           if (running) {
-            try {
-              process.kill(running.pid, "SIGTERM");
-            } catch {
-              // Already dead
-            }
+            // Sweep detached Windows pty-hosts BEFORE killing the parent.
+            // detached:true puts them outside the parent's process tree, so
+            // taskkill /T cannot reach them. The sweep speaks the named-pipe
+            // protocol so node-pty disposes ConPTY gracefully (avoids WER
+            // 0x800700e8). No-op on non-Windows.
+            await sweepWindowsPtyHostsBeforeParentKill();
+            await killProcessTree(running.pid, "SIGTERM");
             await unregister();
           }
           await stopDashboard(running?.port ?? port);
-
-          console.log(chalk.bold.green("\n✓ Orchestrator stopped\n"));
-          console.log(
-            chalk.dim(`  Uptime: since ${running?.startedAt ?? "unknown"}`),
-          );
-          console.log(
-            chalk.dim(`  Projects: ${Object.keys(config.projects).join(", ")}\n`),
-          );
-        } catch (err) {
-          if (err instanceof Error) {
-            console.error(chalk.red("\nError:"), err.message);
-          } else {
-            console.error(chalk.red("\nError:"), String(err));
-          }
-          process.exit(1);
         }
-      });
+        // Targeted stop deliberately does NOT edit `running.json` from this
+        // child CLI process. The long-lived parent supervises lifecycle
+        // workers and will remove the project from `running.projects` after
+        // it observes that the last session became terminal.
+
+        if (projectArg) {
+          console.log(chalk.bold.green(`\n✓ Stopped sessions for ${project.name}\n`));
+        } else {
+          console.log(chalk.bold.green("\n✓ Orchestrator stopped\n"));
+          console.log(chalk.dim(`  Uptime: since ${running?.startedAt ?? "unknown"}`));
+          console.log(chalk.dim(`  Projects: ${Object.keys(config.projects).join(", ")}\n`));
+        }
+      } catch (err) {
+        if (err instanceof Error) {
+          console.error(chalk.red("\nError:"), err.message);
+        } else {
+          console.error(chalk.red("\nError:"), String(err));
+        }
+        process.exit(1);
+      }
+    });
 }

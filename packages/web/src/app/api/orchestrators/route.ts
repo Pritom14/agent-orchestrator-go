@@ -4,6 +4,37 @@ import { getServices } from "@/lib/services";
 import { validateIdentifier, validateConfiguredProject } from "@/lib/validation";
 import { mapSessionsToOrchestrators } from "@/lib/orchestrator-utils";
 
+function classifySpawnError(projectId: string, error: unknown): {
+  status: number;
+  payload: Record<string, unknown>;
+} {
+  const message = error instanceof Error ? error.message : "Failed to spawn orchestrator";
+
+  if (
+    message.includes("already exists and is still registered with git") ||
+    message.includes("outside AO-managed worktree directories") ||
+    message.includes('Found multiple worktrees for orchestrator branch "')
+  ) {
+    return {
+      status: 409,
+      payload: {
+        error: [
+          `AO found an older orchestrator workspace for "${projectId}" but could not safely reuse it automatically.`,
+          "Your repository is safe.",
+          "Review the existing workspace, then either reuse it manually or remove it and create a fresh orchestrator workspace.",
+        ].join(" "),
+        code: "orchestrator_workspace_conflict",
+        recovery: "reuse-or-recreate-workspace",
+      },
+    };
+  }
+
+  return {
+    status: 500,
+    payload: { error: message },
+  };
+}
+
 /**
  * GET /api/orchestrators?project=<projectId>
  * List existing orchestrator sessions for a project.
@@ -78,9 +109,7 @@ export async function POST(request: NextRequest) {
       { status: 201 },
     );
   } catch (err) {
-    return NextResponse.json(
-      { error: err instanceof Error ? err.message : "Failed to spawn orchestrator" },
-      { status: 500 },
-    );
+    const classified = classifySpawnError(body.projectId as string, err);
+    return NextResponse.json(classified.payload, { status: classified.status });
   }
 }
