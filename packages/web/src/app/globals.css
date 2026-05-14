@@ -812,6 +812,87 @@ html.light .xterm .xterm-viewport:hover::-webkit-scrollbar-thumb:active {
   }
 }
 
+.kanban-card-enter-from-left {
+  animation: card-enter-from-left 0.25s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+.kanban-card-enter-from-right {
+  animation: card-enter-from-right 0.25s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes card-enter-from-left {
+  from {
+    opacity: 0;
+    transform: translateX(-48px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.kanban-card-ghost {
+  pointer-events: none;
+  opacity: 0.92;
+  z-index: 1;
+  will-change: transform, opacity;
+}
+
+.kanban-card-ghost-from-left {
+  animation: card-ghost-from-left 0.32s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.kanban-card-ghost-from-right {
+  animation: card-ghost-from-right 0.32s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes card-ghost-from-left {
+  from {
+    opacity: 0.94;
+    transform: translateX(0) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translateX(-14px) scale(0.985);
+  }
+}
+
+@keyframes card-ghost-from-right {
+  from {
+    opacity: 0.94;
+    transform: translateX(0) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translateX(14px) scale(0.985);
+  }
+}
+
+.kanban-column__count.count-updated {
+  animation: kanban-count-pulse 240ms ease-out;
+}
+
+@keyframes kanban-count-pulse {
+  0% {
+    transform: scale(1);
+  }
+  45% {
+    transform: scale(1.08);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+@keyframes card-enter-from-right {
+  from {
+    opacity: 0;
+    transform: translateX(48px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
 /* ── Orchestrator button ──────────────────────────────────────────────── */
 
 .orchestrator-btn {
@@ -3726,8 +3807,7 @@ html.light .xterm .xterm-viewport:hover::-webkit-scrollbar-thumb:active {
   }
 
   .kanban-board {
-    height: auto;
-    min-height: calc(100vh - 240px);
+    height: calc(100dvh - 240px);
   }
 
   .session-card--fixed {

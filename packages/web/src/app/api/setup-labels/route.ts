@@ -8,10 +8,14 @@ const execFileAsync = promisify(execFile);
 export const dynamic = "force-dynamic";
 
 const LABELS = [
+  { name: "card:goal", color: "3B82F6", description: "Goal card to be decomposed by orchestrator" },
+  { name: "card:task", color: "06B6D4", description: "Task card for worker agent" },
   { name: "agent:backlog", color: "6B7280", description: "Available for agent to claim" },
   { name: "agent:in-progress", color: "7C3AED", description: "Agent is working on this" },
+  { name: "agent:review", color: "F59E0B", description: "Agent PR in review" },
   { name: "agent:blocked", color: "DC2626", description: "Agent is blocked" },
   { name: "agent:done", color: "16A34A", description: "Agent completed this" },
+  { name: "merged-unverified", color: "8B5CF6", description: "PR merged, awaiting human verification" },
 ];
 
 /**

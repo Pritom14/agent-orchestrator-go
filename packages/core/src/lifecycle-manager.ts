@@ -31,10 +31,12 @@ import {
   type SCM,
   type Notifier,
   type Session,
+  type Tracker,
   type EventPriority,
   type ProjectConfig as _ProjectConfig,
   type PREnrichmentData,
   type CICheck,
+  type CreateIssueInput,
 } from "./types.js";
 import { updateMetadata } from "./metadata.js";
 import { getSessionsDir } from "./paths.js";
@@ -1201,6 +1203,97 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     }
   }
 
+  /** Sync board labels when session state transitions. */
+  async function syncBoardLabelsOnTransition(
+    session: Session,
+    _oldStatus: SessionStatus,
+    newStatus: SessionStatus,
+  ): Promise<void> {
+    // Only sync if session has an issueId
+    if (!session.issueId) return;
+
+    const project = config.projects[session.projectId];
+    if (!project?.tracker?.plugin) return;
+
+    const tracker = registry.get<Tracker>("tracker", project.tracker.plugin);
+    if (!tracker?.updateIssue) return;
+
+    // Map state transitions to label changes
+    let removeLabel: string | undefined;
+    let addLabel: string | undefined;
+
+    switch (newStatus) {
+      case "working":
+        removeLabel = "agent:backlog";
+        addLabel = "agent:in-progress";
+        break;
+      case "pr_open":
+        removeLabel = "agent:in-progress";
+        addLabel = "agent:review";
+        break;
+      case "ci_failed":
+        addLabel = "agent:blocked";
+        break;
+      case "merged":
+        removeLabel = "agent:review";
+        addLabel = "agent:done";
+        break;
+      default:
+        // No label sync for other states
+        return;
+    }
+
+    try {
+      await tracker.updateIssue(
+        session.issueId,
+        {
+          ...(removeLabel && { removeLabels: [removeLabel] }),
+          ...(addLabel && { labels: [addLabel] }),
+        },
+        project,
+      );
+    } catch {
+      // Non-critical: tracker update failures don't break the session
+      // Error will be logged by the caller
+    }
+  }
+
+  /** Create a Fix card on the tracker when a session enters ci_failed state. */
+  async function createFixCardOnCIFailure(session: Session): Promise<void> {
+    if (!session.issueId || !session.pr) return;
+
+    const project = config.projects[session.projectId];
+    if (!project?.tracker?.plugin) return;
+
+    const tracker = registry.get<Tracker>("tracker", project.tracker.plugin);
+    if (!tracker?.createIssue) return;
+
+    const prUrl = `https://github.com/${session.pr.owner}/${session.pr.repo}/pull/${session.pr.number}`;
+    const checkName = "CI";
+
+    try {
+      await tracker.createIssue(
+        {
+          title: `Fix: CI failure — PR #${session.pr.number}`,
+          description: `CI is failing on PR [#${session.pr.number}](${prUrl}).\n\nParent task: #${session.issueId}\nSession: ${session.id}\n\nInvestigate the failing checks and push a fix commit.`,
+          labels: ["card:task", "agent:backlog"],
+          cardType: "fix",
+          parentId: session.issueId,
+          createdBy: "ci_failure_handler",
+          failureContext: {
+            checkName,
+            prUrl,
+            errorSummary: `CI failing on PR #${session.pr.number}`,
+            parentTaskId: session.issueId,
+          },
+        },
+        project,
+      );
+    } catch {
+      // Non-critical: Fix card creation failure doesn't break the session
+    }
+  }
+
   /** Poll a single session and handle state transitions. */
   async function checkSession(session: Session): Promise<void> {
     // Use tracked state if available; otherwise use the persisted metadata status
@@ -1227,6 +1320,25 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         data: { oldStatus, newStatus },
         level: transitionLogLevel(newStatus),
       });
+
+      // Sync board labels for task cards when state transitions
+      syncBoardLabelsOnTransition(session, oldStatus, newStatus).catch((err) => {
+        // Non-critical: log but don't fail the transition
+        console.error(
+          `[lifecycle] Failed to sync board labels for session ${session.id}:`,
+          err,
+        );
+      });
+
+      // Create Fix card on tracker when CI fails
+      if (newStatus === "ci_failed") {
+        createFixCardOnCIFailure(session).catch((err) => {
+          console.error(
+            `[lifecycle] Failed to create fix card for session ${session.id}:`,
+            err,
+          );
+        });
+      }
 
       // Reset allCompleteEmitted when any session becomes active again
       if (!TERMINAL_STATUSES.has(newStatus)) {

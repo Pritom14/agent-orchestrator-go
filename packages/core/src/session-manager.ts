@@ -1458,7 +1458,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       status: "working",
       activity: "active",
       branch,
-      issueId: null,
+      issueId: orchestratorConfig.issueId ?? null,
       pr: null,
       workspacePath,
       runtimeHandle: handle,
@@ -1482,6 +1482,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         createdAt: new Date().toISOString(),
         runtimeHandle: JSON.stringify(handle),
         opencodeSessionId: reusableOpenCodeSessionId,
+        ...(orchestratorConfig.issueId ? { issueId: orchestratorConfig.issueId } : {}),
       });
 
       if (plugins.agent.postLaunchSetup) {

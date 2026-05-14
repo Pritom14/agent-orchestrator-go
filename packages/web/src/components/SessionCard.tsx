@@ -21,6 +21,8 @@ interface SessionCardProps {
   onKill?: (sessionId: string) => void;
   onMerge?: (prNumber: number) => void;
   onRestore?: (sessionId: string) => void;
+  enterDirection?: "left" | "right";
+  transitionState?: "enter" | "ghost";
 }
 
 /**
@@ -91,7 +93,17 @@ function getDoneStatusInfo(session: DashboardSession): {
   };
 }
 
-function SessionCardView({ session, onSend, onKill, onMerge, onRestore }: SessionCardProps) {
+function SessionCardView({
+  session,
+  onSend,
+  onKill,
+  onMerge,
+  onRestore,
+  enterDirection,
+  transitionState,
+}: SessionCardProps) {
+  // Capture direction at mount only — prevents class/animation changing on re-renders
+  const [mountEnterDirection] = useState(enterDirection);
   const [expanded, setExpanded] = useState(false);
   const [sendingAction, setSendingAction] = useState<string | null>(null);
   const [failedAction, setFailedAction] = useState<string | null>(null);
@@ -180,6 +192,7 @@ function SessionCardView({ session, onSend, onKill, onMerge, onRestore }: Sessio
     : alerts.length > 0
       ? "session-card--alert-frame"
       : "session-card--fixed";
+  const isGhost = transitionState === "ghost";
   const accentClass = isReadyToMerge
     ? "session-card--accent-merge"
     : level === "working"
@@ -425,11 +438,18 @@ function SessionCardView({ session, onSend, onKill, onMerge, onRestore }: Sessio
   return (
     <div
       className={cn(
-        "session-card kanban-card-enter border",
+        "session-card border",
+        isGhost ? "kanban-card-ghost" : "kanban-card-enter",
+        !isGhost && mountEnterDirection === "left" && "kanban-card-enter-from-left",
+        !isGhost && mountEnterDirection === "right" && "kanban-card-enter-from-right",
+        isGhost && mountEnterDirection === "left" && "kanban-card-ghost-from-left",
+        isGhost && mountEnterDirection === "right" && "kanban-card-ghost-from-right",
         cardFrameClass,
         accentClass,
         isReadyToMerge && "card-merge-ready",
       )}
+      aria-hidden={isGhost || undefined}
+      data-transition-state={transitionState}
     >
       <div className="session-card__header">
         <span
@@ -791,7 +811,9 @@ function areSessionCardPropsEqual(prev: SessionCardProps, next: SessionCardProps
     prev.onSend === next.onSend &&
     prev.onKill === next.onKill &&
     prev.onMerge === next.onMerge &&
-    prev.onRestore === next.onRestore
+    prev.onRestore === next.onRestore &&
+    prev.enterDirection === next.enterDirection &&
+    prev.transitionState === next.transitionState
   );
 }
 

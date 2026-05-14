@@ -17,6 +17,7 @@ import {
   createPluginRegistry,
   createSessionManager,
   createLifecycleManager,
+  generateOrchestratorPrompt,
   type OrchestratorConfig,
   type PluginRegistry,
   type OpenCodeSessionManager,
@@ -120,6 +121,34 @@ export function startBacklogPoller(): void {
 
 // Track which issues we've already processed to avoid repeated API calls
 const processedIssues = new Set<string>();
+
+/** Generate orchestrator systemPrompt with goal issue context. */
+async function generateOrchestratorSystemPrompt(
+  config: OrchestratorConfig,
+  registry: PluginRegistry,
+  projectId: string,
+  project: ProjectConfig,
+  issueId: string,
+): Promise<string> {
+  let goalContext = "";
+  try {
+    const tracker = registry.get<Tracker>("tracker", project.tracker?.plugin ?? "");
+    if (tracker?.getIssue) {
+      const issue = await tracker.getIssue(issueId, project);
+      goalContext = `\n\n## Your Goal Issue\n\n**Title:** ${issue.title}\n\n**Description:**\n${issue.description || "(no description)"}`;
+    }
+  } catch (err) {
+    console.error(`[orchestrator] Failed to fetch goal issue ${issueId}:`, err);
+  }
+
+  const basePrompt = generateOrchestratorPrompt({
+    config,
+    projectId,
+    project,
+  });
+
+  return basePrompt + goalContext;
+}
 
 /** Label GitHub issues for verification when their PRs have been merged. */
 async function labelIssuesForVerification(
@@ -268,22 +297,67 @@ export async function pollBacklog(): Promise<void> {
         if (activeIssueIds.has(issue.id.toLowerCase())) continue;
 
         try {
-          await sessionManager.spawn({ projectId, issueId: issue.id });
-          availableSlots--;
+          // Check if this is a goal card (card:goal + agent:backlog)
+          const isGoalCard = issue.labels.includes("card:goal");
 
-          activeIssueIds.add(issue.id.toLowerCase());
+          if (isGoalCard && issue.labels.includes("agent:backlog")) {
+            // Spawn an ORCHESTRATOR session for goal cards
+            const systemPrompt = await generateOrchestratorSystemPrompt(config, registry, projectId, project, issue.id);
+            await sessionManager.spawnOrchestrator({ projectId, issueId: issue.id, systemPrompt });
+            availableSlots--;
 
-          // Mark as claimed on the tracker
-          if (tracker.updateIssue) {
-            await tracker.updateIssue(
-              issue.id,
-              {
-                labels: ["agent:in-progress"],
-                removeLabels: ["agent:backlog"],
-                comment: "Claimed by agent orchestrator — session spawned.",
-              },
-              project,
-            );
+            activeIssueIds.add(issue.id.toLowerCase());
+
+            // Remove agent:backlog so it doesn't spawn again
+            if (tracker.updateIssue) {
+              await tracker.updateIssue(
+                issue.id,
+                {
+                  removeLabels: ["agent:backlog"],
+                  comment: "Claimed by orchestrator — goal session spawned.",
+                },
+                project,
+              );
+            }
+          } else if (issue.labels.includes("card:task") && issue.labels.includes("agent:backlog")) {
+            // Spawn a WORKER session for task cards
+            await sessionManager.spawn({ projectId, issueId: issue.id });
+            availableSlots--;
+
+            activeIssueIds.add(issue.id.toLowerCase());
+
+            // Mark as claimed on the tracker
+            if (tracker.updateIssue) {
+              await tracker.updateIssue(
+                issue.id,
+                {
+                  labels: ["agent:in-progress"],
+                  removeLabels: ["agent:backlog"],
+                  comment: "Claimed by agent orchestrator — session spawned.",
+                },
+                project,
+              );
+            }
+          } else if (issue.labels.includes("agent:backlog")) {
+            // Fallback: Spawn a WORKER session for any unlabeled agent:backlog issues
+            // (preserves backwards compatibility for pre-existing issues without card:goal/card:task)
+            await sessionManager.spawn({ projectId, issueId: issue.id });
+            availableSlots--;
+
+            activeIssueIds.add(issue.id.toLowerCase());
+
+            // Mark as claimed on the tracker
+            if (tracker.updateIssue) {
+              await tracker.updateIssue(
+                issue.id,
+                {
+                  labels: ["agent:in-progress"],
+                  removeLabels: ["agent:backlog"],
+                  comment: "Claimed by agent orchestrator — session spawned.",
+                },
+                project,
+              );
+            }
           }
         } catch (err) {
           console.error(`[backlog] Failed to spawn session for issue ${issue.id}:`, err);

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { useMediaQuery, MOBILE_BREAKPOINT } from "@/hooks/useMediaQuery";
 import {
@@ -49,6 +49,13 @@ const MOBILE_FILTERS = [
 type MobileFilterValue = (typeof MOBILE_FILTERS)[number]["value"];
 const EMPTY_ORCHESTRATORS: DashboardOrchestratorLink[] = [];
 
+interface TransitionGhost {
+  id: string;
+  session: DashboardSession;
+  level: AttentionLevel;
+  direction: "left" | "right";
+}
+
 function formatRelativeTimeCompact(isoDate: string | null): string {
   if (!isoDate) return "just now";
   const timestamp = new Date(isoDate).getTime();
@@ -79,6 +86,30 @@ function mergeOrchestrators(
   }
 
   return [...merged.values()];
+}
+
+function getMoveDirection(from: AttentionLevel, to: AttentionLevel): "left" | "right" | null {
+  const fromIdx = KANBAN_LEVELS.indexOf(from as (typeof KANBAN_LEVELS)[number]);
+  const toIdx = KANBAN_LEVELS.indexOf(to as (typeof KANBAN_LEVELS)[number]);
+  if (fromIdx === -1 || toIdx === -1 || fromIdx === toIdx) return null;
+  return fromIdx < toIdx ? "left" : "right";
+}
+
+function groupTransitionGhosts(ghosts: TransitionGhost[]): Record<AttentionLevel, TransitionGhost[]> {
+  const grouped: Record<AttentionLevel, TransitionGhost[]> = {
+    merge: [],
+    respond: [],
+    review: [],
+    pending: [],
+    working: [],
+    done: [],
+  };
+
+  for (const ghost of ghosts) {
+    grouped[ghost.level].push(ghost);
+  }
+
+  return grouped;
 }
 
 function DoneCard({
@@ -267,6 +298,7 @@ function DashboardInner({
   const isMobile = useMediaQuery(MOBILE_BREAKPOINT);
   const [hasMounted, setHasMounted] = useState(false);
   const [mobileFilter, setMobileFilter] = useState<MobileFilterValue>("all");
+  const [transitionGhosts, setTransitionGhosts] = useState<TransitionGhost[]>([]);
   const showSidebar = projects.length >= 1;
   const { showToast } = useToast();
   const [sheetState, setSheetState] = useState<{
@@ -276,6 +308,8 @@ function DashboardInner({
   const [sheetSessionOverride, setSheetSessionOverride] = useState<DashboardSession | null>(null);
   const [doneExpanded, setDoneExpanded] = useState(false);
   const sessionsRef = useRef(sessions);
+  const previousSessionsRef = useRef<Record<string, DashboardSession>>({});
+  const ghostTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
 
   sessionsRef.current = sessions;
   const allProjectsView = projects.length > 1 && showSidebar && projectId === undefined;
@@ -406,6 +440,92 @@ function DashboardInner({
     }
     return zones;
   }, [displaySessions]);
+
+  const transitionGhostsByLevel = useMemo(
+    () => groupTransitionGhosts(transitionGhosts),
+    [transitionGhosts],
+  );
+
+  // Track which sessions just changed columns and their movement direction.
+  // Read from ref synchronously during render so the direction is available when
+  // new cards mount (an effect would fire too late — after the mount animation starts).
+  const prevLevelsRef = useRef<Record<string, string>>({});
+  const movedSessionDirections = useMemo(() => {
+    const prev = prevLevelsRef.current;
+    const moved = new Map<string, "left" | "right">();
+    for (const session of displaySessions) {
+      const currentLevel = getAttentionLevel(session);
+      const prevLevel = prev[session.id];
+      if (prevLevel !== undefined && prevLevel !== currentLevel) {
+        const prevIdx = KANBAN_LEVELS.indexOf(prevLevel as typeof KANBAN_LEVELS[number]);
+        const curIdx = KANBAN_LEVELS.indexOf(currentLevel as typeof KANBAN_LEVELS[number]);
+        // Card moved right in board → enters from left; moved left → enters from right
+        moved.set(session.id, prevIdx < curIdx ? "left" : "right");
+      }
+    }
+    return moved;
+  }, [displaySessions]);
+
+  useLayoutEffect(() => {
+    const previousSessions = previousSessionsRef.current;
+    const nextSessionsById = Object.fromEntries(displaySessions.map((session) => [session.id, session]));
+    const nextGhosts: TransitionGhost[] = [];
+
+    for (const session of displaySessions) {
+      const previousSession = previousSessions[session.id];
+      if (!previousSession) continue;
+
+      const previousLevel = getAttentionLevel(previousSession);
+      const currentLevel = getAttentionLevel(session);
+      if (previousLevel === currentLevel) continue;
+
+      const enterDirection = getMoveDirection(previousLevel, currentLevel);
+      if (!enterDirection) continue;
+
+      const ghostId = `${session.id}:${previousLevel}->${currentLevel}:${Date.now()}`;
+      nextGhosts.push({
+        id: ghostId,
+        session: previousSession,
+        level: previousLevel,
+        direction: enterDirection === "left" ? "right" : "left",
+      });
+    }
+
+    if (nextGhosts.length > 0) {
+      setTransitionGhosts((current) => [...current, ...nextGhosts]);
+
+      for (const ghost of nextGhosts) {
+        const existingTimer = ghostTimersRef.current.get(ghost.id);
+        if (existingTimer) {
+          clearTimeout(existingTimer);
+        }
+
+        const timer = setTimeout(() => {
+          setTransitionGhosts((current) => current.filter((entry) => entry.id !== ghost.id));
+          ghostTimersRef.current.delete(ghost.id);
+        }, 320);
+        ghostTimersRef.current.set(ghost.id, timer);
+      }
+    }
+
+    previousSessionsRef.current = nextSessionsById;
+  }, [displaySessions]);
+
+  // Update prevLevels AFTER the render so useMemo above sees old values when sessions change
+  useEffect(() => {
+    for (const session of displaySessions) {
+      prevLevelsRef.current[session.id] = getAttentionLevel(session);
+    }
+  }, [displaySessions]);
+
+  useEffect(() => {
+    return () => {
+      for (const timer of ghostTimersRef.current.values()) {
+        clearTimeout(timer);
+      }
+      ghostTimersRef.current.clear();
+    };
+  }, []);
 
   // Auto-expand the most urgent non-empty section when switching to mobile.
   // Intentionally seeded once per mobile mode change, not on every session update.
@@ -803,6 +923,8 @@ function DashboardInner({
                           onKill={handleKill}
                           onMerge={handleMerge}
                           onRestore={handleRestore}
+                          movedSessionDirections={movedSessionDirections}
+                          transitionGhosts={transitionGhostsByLevel[level]}
                         />
                       ))}
                     </div>
@@ -1021,6 +1143,8 @@ function DashboardInner({
                         onKill={handleKill}
                         onMerge={handleMerge}
                         onRestore={handleRestore}
+                        movedSessionDirections={movedSessionDirections}
+                        transitionGhosts={transitionGhostsByLevel[level]}
                       />
                     ))}
                   </div>

@@ -698,6 +698,12 @@ function createClaudeCodeAgent(): Agent {
         env["AO_ISSUE_ID"] = config.issueId;
       }
 
+      // Force gh CLI to target the project repo, not the upstream parent fork.
+      // Without this, `gh pr create` in a forked repo defaults to the parent.
+      if (config.projectConfig.repo) {
+        env["GH_REPO"] = config.projectConfig.repo;
+      }
+
       return env;
     },
 

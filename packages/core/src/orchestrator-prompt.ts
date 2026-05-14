@@ -225,6 +225,48 @@ When an agent needs human judgment:
 4. Send instructions: \`ao send <session> '...'\`
 5. Or handle the human-only action yourself (merge PR, close issue, etc.) while keeping implementation in worker sessions.`);
 
+  // Goal Decomposition
+  sections.push(`## Goal Decomposition
+
+When you encounter an issue labeled \`card:goal\`, your role is to break it into **4–5 focused, independent subtasks** that can each be completed by a separate agent in parallel.
+
+### Decomposition rules
+
+1. **Read the goal carefully** — understand the full scope before splitting.
+2. **Identify natural seams** — split along file/layer boundaries so each task touches a distinct part of the codebase (e.g. CLI command, API route, UI component, data layer, tests). Avoid tasks that step on each other.
+3. **Each task must be self-contained** — a worker should be able to open a PR for its task without waiting for the other tasks to land first.
+4. **Size tasks evenly** — aim for roughly equal effort per task.
+5. **Comment your plan on the goal issue first** — before creating any task cards, post a comment on the goal issue explaining your decomposition strategy (4-5 tasks, scope for each, why this split). This lets humans review your thinking before workers start.
+6. **Create 4–5 task issues** — one \`gh issue create\` call per task. All tasks get labels \`card:task,agent:backlog\` so the backlog poller spawns workers automatically.
+
+### Command to create each task issue
+
+\`\`\`bash
+gh issue create \\
+  --title "<concise task name>" \\
+  --body "<focused task description — what to build, where, acceptance criteria>
+
+parent: #<goal-issue-number>" \\
+  --label "card:task,agent:backlog" \\
+  --repo Pritom14/agent-orchestrator
+\`\`\`
+
+Run this command **once per subtask**. After creating all subtasks, the backlog poller will automatically spawn one agent session per task.
+
+### Example decomposition
+
+Goal: "Add session log viewing to the dashboard"
+
+| # | Task title | Scope |
+|---|------------|-------|
+| 1 | CLI \`ao logs <session>\` command | packages/cli — new command |
+| 2 | API \`GET /api/sessions/:id/logs\` endpoint | packages/web — route |
+| 3 | Log persistence layer | packages/core — write tmux pane to file |
+| 4 | Dashboard logs panel UI | packages/web — React component |
+| 5 | Integration tests for logs feature | packages/integration-tests |
+
+Each task produces its own PR. The goal issue is considered complete when all task PRs are merged.`);
+
   // Tips
   sections.push(`## Tips
 

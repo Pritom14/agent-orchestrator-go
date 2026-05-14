@@ -238,6 +238,7 @@ export interface SessionSpawnConfig {
 export interface OrchestratorSpawnConfig {
   projectId: string;
   systemPrompt?: string;
+  issueId?: string;
 }
 
 // =============================================================================
@@ -542,6 +543,16 @@ export interface Issue {
   assignee?: string;
   priority?: number;
   branchName?: string;
+  cardType?: "epic" | "story" | "task" | "subtask" | "fix";
+  parentId?: string;
+  sessionId?: string;
+  createdBy?: "human" | "orchestrator" | "ci_failure_handler";
+  failureContext?: {
+    checkName: string;
+    prUrl: string;
+    errorSummary: string;
+    parentTaskId: string;
+  };
 }
 
 export interface IssueFilters {
@@ -565,6 +576,15 @@ export interface CreateIssueInput {
   labels?: string[];
   assignee?: string;
   priority?: number;
+  cardType?: "epic" | "story" | "task" | "subtask" | "fix";
+  parentId?: string;
+  createdBy?: "human" | "orchestrator" | "ci_failure_handler";
+  failureContext?: {
+    checkName: string;
+    prUrl: string;
+    errorSummary: string;
+    parentTaskId: string;
+  };
 }
 
 // =============================================================================

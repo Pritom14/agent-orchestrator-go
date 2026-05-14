@@ -12,6 +12,11 @@ import { getSessionTitle } from "@/lib/format";
 interface AttentionZoneProps {
   level: AttentionLevel;
   sessions: DashboardSession[];
+  transitionGhosts?: Array<{
+    id: string;
+    session: DashboardSession;
+    direction: "left" | "right";
+  }>;
   onSend?: (sessionId: string, message: string) => Promise<void> | void;
   onKill?: (sessionId: string) => void;
   onMerge?: (prNumber: number) => void;
@@ -26,6 +31,8 @@ interface AttentionZoneProps {
   onPreview?: (session: DashboardSession) => void;
   /** Reset internal "show all" state when this value changes */
   resetKey?: string | number | null;
+  /** Track which sessions just moved columns and their direction for animation purposes */
+  movedSessionDirections?: Map<string, "left" | "right">;
 }
 
 const zoneConfig: Record<
@@ -73,6 +80,7 @@ const zoneConfig: Record<
 function AttentionZoneView({
   level,
   sessions,
+  transitionGhosts,
   onSend,
   onKill,
   onMerge,
@@ -82,6 +90,7 @@ function AttentionZoneView({
   compactMobile,
   onPreview,
   resetKey,
+  movedSessionDirections,
 }: AttentionZoneProps) {
   const config = zoneConfig[level];
   const isAccordion = onToggle !== undefined;
@@ -89,6 +98,8 @@ function AttentionZoneView({
   const visibleSessions =
     isAccordion && compactMobile && !showAll ? sessions.slice(0, 5) : sessions;
   const hiddenCount = sessions.length - visibleSessions.length;
+  const hasTransitionGhosts = (transitionGhosts?.length ?? 0) > 0;
+  const hasVisibleCards = sessions.length > 0 || hasTransitionGhosts;
 
   useEffect(() => {
     if (collapsed) {
@@ -120,19 +131,33 @@ function AttentionZoneView({
         </button>
 
         <div id={`accordion-body-${level}`} className="accordion-body">
-          {sessions.length > 0 ? (
+          {hasVisibleCards ? (
             <div className={compactMobile ? "mobile-session-list" : "flex flex-col gap-2 p-3"}>
+              {transitionGhosts?.map((ghost) =>
+                compactMobile ? null : (
+                  <SessionCard
+                    key={ghost.id}
+                    session={ghost.session}
+                    onSend={onSend}
+                    onKill={onKill}
+                    onMerge={onMerge}
+                    onRestore={onRestore}
+                    enterDirection={ghost.direction}
+                    transitionState="ghost"
+                  />
+                ),
+              )}
               {visibleSessions.map((session) =>
                 compactMobile ? (
                   <MobileSessionRow
-                    key={session.id}
+                    key={`${session.id}-${level}`}
                     session={session}
                     level={level}
                     onPreview={onPreview}
                   />
                 ) : (
                   <SessionCard
-                    key={session.id}
+                    key={`${session.id}-${level}`}
                     session={session}
                     onSend={onSend}
                     onKill={onKill}
@@ -167,21 +192,39 @@ function AttentionZoneView({
         <div className="kanban-column__title-row">
           <div className="kanban-column__dot" data-level={level} />
           <span className="kanban-column__title">{config.label}</span>
-          <span className="kanban-column__count">{sessions.length}</span>
+          <span
+            className={`kanban-column__count${sessions.some(s => movedSessionDirections?.has(s.id)) ? " count-updated" : ""}`}
+            key={sessions.filter(s => movedSessionDirections?.has(s.id)).length}
+          >
+            {sessions.length}
+          </span>
         </div>
       </div>
 
       <div className="kanban-column-body">
-        {sessions.length > 0 ? (
+        {hasVisibleCards ? (
           <div className="kanban-column__stack">
+            {transitionGhosts?.map((ghost) => (
+              <SessionCard
+                key={ghost.id}
+                session={ghost.session}
+                onSend={onSend}
+                onKill={onKill}
+                onMerge={onMerge}
+                onRestore={onRestore}
+                enterDirection={ghost.direction}
+                transitionState="ghost"
+              />
+            ))}
             {sessions.map((session) => (
               <SessionCard
-                key={session.id}
+                key={`${session.id}-${level}`}
                 session={session}
                 onSend={onSend}
                 onKill={onKill}
                 onMerge={onMerge}
                 onRestore={onRestore}
+                enterDirection={movedSessionDirections?.get(session.id)}
               />
             ))}
           </div>
@@ -192,8 +235,21 @@ function AttentionZoneView({
 }
 
 function areAttentionZonePropsEqual(prev: AttentionZoneProps, next: AttentionZoneProps): boolean {
+  const prevGhosts = prev.transitionGhosts ?? [];
+  const nextGhosts = next.transitionGhosts ?? [];
+
   return (
     prev.level === next.level &&
+    prevGhosts.length === nextGhosts.length &&
+    prevGhosts.every((ghost, index) => {
+      const nextGhost = nextGhosts[index];
+      return (
+        nextGhost !== undefined &&
+        ghost.id === nextGhost.id &&
+        ghost.direction === nextGhost.direction &&
+        ghost.session === nextGhost.session
+      );
+    }) &&
     prev.collapsed === next.collapsed &&
     prev.onToggle === next.onToggle &&
     prev.onSend === next.onSend &&

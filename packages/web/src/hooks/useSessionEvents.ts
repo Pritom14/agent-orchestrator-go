@@ -9,7 +9,7 @@ import {
 } from "@/lib/types";
 
 /** Debounce before fetching full session list after membership change. */
-const MEMBERSHIP_REFRESH_DELAY_MS = 120;
+const MEMBERSHIP_REFRESH_DELAY_MS = 450;
 /** Re-fetch full session list if no refresh has happened in this interval. */
 const STALE_REFRESH_INTERVAL_MS = 15000;
 /** Grace period before declaring "disconnected" (allows for transient reconnects). */
@@ -160,14 +160,11 @@ export function useSessionEvents(
             }
 
             lastRefreshAtRef.current = Date.now();
+            const freshSessions = updated.sessions as DashboardSession[];
             const sseAttentionLevels = Object.fromEntries(
-              updated.sessions.map((s) => [s.id, getAttentionLevel(s)]),
+              freshSessions.map((s) => [s.id, getAttentionLevel(s)]),
             ) as SSEAttentionMap;
-            dispatch({
-              type: "reset",
-              sessions: updated.sessions,
-              sseAttentionLevels,
-            });
+            dispatch({ type: "reset", sessions: freshSessions, sseAttentionLevels });
           },
         )
         .catch((err: unknown) => {
