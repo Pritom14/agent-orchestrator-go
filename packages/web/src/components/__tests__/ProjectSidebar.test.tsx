@@ -399,7 +399,7 @@ describe("ProjectSidebar", () => {
       />,
     );
 
-    expect(screen.getByRole("button", { name: /^Project One 1$/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^Project One 2$/ })).toBeInTheDocument();
     expect(
       screen.getByRole("link", { name: "Open Runtime missing but needs review" }),
     ).toBeInTheDocument();

@@ -70,6 +70,41 @@ function loadShowSessionId(): boolean {
   }
 }
 
+const SHOW_KILLED_KEY = "ao:sidebar:show-killed";
+const SHOW_DONE_KEY = "ao:sidebar:show-done";
+const EXPANDED_PROJECTS_KEY = "ao:sidebar:expanded-projects";
+
+function loadShowKilled(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    return window.sessionStorage.getItem(SHOW_KILLED_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function loadShowDone(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    return window.sessionStorage.getItem(SHOW_DONE_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function loadExpandedProjects(): Set<string> | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.sessionStorage.getItem(EXPANDED_PROJECTS_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return new Set<string>(parsed);
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 const LEVEL_LABELS: Record<AttentionLevel, string> = {
   working: "working",
   pending: "pending",
@@ -149,17 +184,9 @@ const SessionRow = memo(function SessionRow({
           {showSessionId ? (
             <div className="project-sidebar__sess-meta">
               <span className="project-sidebar__sess-id">{session.id}</span>
-              <span className="project-sidebar__sess-status">
-                {LEVEL_LABELS[level]}
-              </span>
             </div>
           ) : null}
         </div>
-        {!showSessionId ? (
-          <span className="project-sidebar__sess-status project-sidebar__sess-status--inline">
-            {LEVEL_LABELS[level]}
-          </span>
-        ) : null}
       </a>
       <button
         type="button"
@@ -269,10 +296,12 @@ function ProjectSidebarInner({
   const isLoading = loading || sessions === null;
 
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(
-    () => new Set(activeProjectId && activeProjectId !== "all" ? [activeProjectId] : []),
+    () =>
+      loadExpandedProjects() ??
+      new Set(activeProjectId && activeProjectId !== "all" ? [activeProjectId] : []),
   );
-  const [showKilled, setShowKilled] = useState(false);
-  const [showDone, setShowDone] = useState(false);
+  const [showKilled, setShowKilled] = useState<boolean>(loadShowKilled);
+  const [showDone, setShowDone] = useState<boolean>(loadShowDone);
   const [showSessionId, setShowSessionId] = useState<boolean>(loadShowSessionId);
   // Inline session-rename state. Only one row is edited at a time. `pendingRenames`
   // mirrors the in-flight / just-saved value so the new label appears immediately
@@ -301,6 +330,30 @@ function ProjectSidebarInner({
       // localStorage unavailable — accept the in-memory state for this session.
     }
   }, [showSessionId]);
+
+  useEffect(() => {
+    try {
+      window.sessionStorage.setItem(SHOW_KILLED_KEY, String(showKilled));
+    } catch {
+      // sessionStorage unavailable — accept in-memory state.
+    }
+  }, [showKilled]);
+
+  useEffect(() => {
+    try {
+      window.sessionStorage.setItem(SHOW_DONE_KEY, String(showDone));
+    } catch {
+      // sessionStorage unavailable — accept in-memory state.
+    }
+  }, [showDone]);
+
+  useEffect(() => {
+    try {
+      window.sessionStorage.setItem(EXPANDED_PROJECTS_KEY, JSON.stringify([...expandedProjects]));
+    } catch {
+      // sessionStorage unavailable — accept in-memory state.
+    }
+  }, [expandedProjects]);
 
   // Close the settings popover on outside click or Escape.
   useEffect(() => {
@@ -425,6 +478,18 @@ function ProjectSidebarInner({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionsKey, prefixByProject, allPrefixes, visibleProjects, showKilled, showDone]);
 
+  const totalSessionsByProject = useMemo(() => {
+    const map = new Map<string, number>();
+    const validProjectIds = new Set(visibleProjects.map((p) => p.id));
+    for (const s of sessionsRef.current ?? []) {
+      if (!validProjectIds.has(s.projectId)) continue;
+      if (isOrchestratorSession(s, prefixByProject.get(s.projectId), allPrefixes)) continue;
+      map.set(s.projectId, (map.get(s.projectId) ?? 0) + 1);
+    }
+    return map;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionsKey, prefixByProject, allPrefixes, visibleProjects]);
+
   // Clear an optimistic rename once the prop session.displayName catches up.
   // Without this, we'd keep masking the server value forever after a save.
   useEffect(() => {
@@ -441,18 +506,20 @@ function ProjectSidebarInner({
     if (changed) setPendingRenames(next);
   }, [sessions, pendingRenames]);
 
-  const startRename = useCallback((session: DashboardSession, currentTitle: string) => {
-    // Prefer the in-flight optimistic value over the prop — if the user opens
-    // rename while a previous PATCH is still propagating, the prop still shows
-    // the pre-rename value but we want the input to start from the latest.
-    // Auto-derived displayName isn't pre-filled (user-set flag absent) — start
-    // from the live title so the user types over the visible label.
-    const pending = pendingRenames.get(session.id);
-    const initial =
-      pending ?? (session.displayNameUserSet ? (session.displayName ?? "") : "");
-    setEditingSessionId(session.id);
-    setEditingValue(initial || currentTitle);
-  }, [pendingRenames]);
+  const startRename = useCallback(
+    (session: DashboardSession, currentTitle: string) => {
+      // Prefer the in-flight optimistic value over the prop — if the user opens
+      // rename while a previous PATCH is still propagating, the prop still shows
+      // the pre-rename value but we want the input to start from the latest.
+      // Auto-derived displayName isn't pre-filled (user-set flag absent) — start
+      // from the live title so the user types over the visible label.
+      const pending = pendingRenames.get(session.id);
+      const initial = pending ?? (session.displayNameUserSet ? (session.displayName ?? "") : "");
+      setEditingSessionId(session.id);
+      setEditingValue(initial || currentTitle);
+    },
+    [pendingRenames],
+  );
 
   const cancelRename = () => {
     setEditingSessionId(null);
@@ -495,17 +562,20 @@ function ProjectSidebarInner({
     }
   };
 
-  const navigate = useCallback((url: string, session?: DashboardSession) => {
-    if (session) {
-      try {
-        sessionStorage.setItem(`ao-session-nav:${session.id}`, JSON.stringify(session));
-      } catch {
-        // sessionStorage unavailable — silent fallback
+  const navigate = useCallback(
+    (url: string, session?: DashboardSession) => {
+      if (session) {
+        try {
+          sessionStorage.setItem(`ao-session-nav:${session.id}`, JSON.stringify(session));
+        } catch {
+          // sessionStorage unavailable — silent fallback
+        }
       }
-    }
-    router.push(url);
-    onMobileClose?.();
-  }, [router, onMobileClose]);
+      router.push(url);
+      onMobileClose?.();
+    },
+    [router, onMobileClose],
+  );
 
   const toggleExpand = (projectId: string) => {
     setExpandedProjects((prev) => {
@@ -672,6 +742,16 @@ function ProjectSidebarInner({
 
       {/* Project tree */}
       <div className="project-sidebar__tree flex-1 overflow-y-auto overflow-x-hidden">
+        {sessions === null ? (
+          <div className="space-y-1 px-3 py-3" aria-label="Loading projects">
+            {Array.from({ length: 4 }, (_, i) => (
+              <div key={i} className="flex items-center gap-2 py-1">
+                <div className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-[var(--color-border-strong)]" />
+                <div className="h-3 flex-1 animate-pulse rounded bg-[var(--color-bg-primary)]" />
+              </div>
+            ))}
+          </div>
+        ) : null}
         {visibleProjects.map((project) => {
           const workerSessions = sessionsByProject.get(project.id) ?? [];
           const isExpanded = expandedProjects.has(project.id);
@@ -753,7 +833,7 @@ function ProjectSidebarInner({
                         hasActiveSessions && "project-sidebar__proj-badge--active",
                       )}
                     >
-                      {workerSessions.length}
+                      {totalSessionsByProject.get(project.id) ?? 0}
                     </span>
                   </button>
                 )}
@@ -894,7 +974,7 @@ function ProjectSidebarInner({
               {/* Sessions */}
               {!isDegraded && isExpanded && (
                 <div className="project-sidebar__sessions">
-                  {isLoading ? (
+                  {sessions === null ? (
                     <div className="space-y-2 px-3 py-2" aria-label="Loading sessions">
                       {Array.from({ length: 3 }, (_, index) => (
                         <div
@@ -982,7 +1062,18 @@ function ProjectSidebarInner({
                       </button>
                     </div>
                   ) : (
-                    <div className="project-sidebar__empty">No sessions shown</div>
+                    <div className="project-sidebar__empty">
+                      {!showDone && !showKilled ? (
+                        <>
+                          No active sessions
+                          <span className="project-sidebar__empty-hint">
+                            Done · killed sessions are hidden
+                          </span>
+                        </>
+                      ) : (
+                        "No sessions"
+                      )}
+                    </div>
                   )}
                 </div>
               )}
