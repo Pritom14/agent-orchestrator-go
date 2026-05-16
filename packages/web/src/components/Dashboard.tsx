@@ -221,7 +221,7 @@ function DashboardInner({
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const handleToggleSidebar = useCallback(() => {
-    if (isInsideLayout) { parentCtx!.onToggleSidebar(); return; }
+    if (isInsideLayout && parentCtx) { parentCtx.onToggleSidebar(); return; }
     if (isMobile) {
       setMobileSidebarOpen((v) => !v);
     } else {

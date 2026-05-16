@@ -105,15 +105,6 @@ function loadExpandedProjects(): Set<string> | null {
   }
 }
 
-const LEVEL_LABELS: Record<AttentionLevel, string> = {
-  working: "working",
-  pending: "pending",
-  review: "review",
-  respond: "respond",
-  action: "action",
-  merge: "merge",
-  done: "done",
-};
 
 export function ProjectSidebar(props: ProjectSidebarProps) {
   if (props.projects.length === 0) {
@@ -293,7 +284,7 @@ function ProjectSidebarInner({
   onMobileClose,
 }: ProjectSidebarProps) {
   const router = useRouter();
-  const isLoading = loading || sessions === null;
+  const _isLoading = loading || sessions === null;
 
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(
     () =>
@@ -456,7 +447,6 @@ function ProjectSidebarInner({
 
     // Read via ref so this memo only reruns when sessionsKey changes (content
     // changed), not when sessions gets a new array reference with identical data.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
     for (const s of sessionsRef.current ?? []) {
       // Only include sessions whose projectId matches a configured project
       if (!validProjectIds.has(s.projectId)) continue;
@@ -473,9 +463,6 @@ function ProjectSidebarInner({
       map.set(s.projectId, list);
     }
     return map;
-    // sessionsKey is the stable proxy for sessions content — intentionally omitting
-    // the sessions array reference itself to avoid recomputing on identity-only changes.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionsKey, prefixByProject, allPrefixes, visibleProjects, showKilled, showDone]);
 
   const totalSessionsByProject = useMemo(() => {
@@ -487,7 +474,6 @@ function ProjectSidebarInner({
       map.set(s.projectId, (map.get(s.projectId) ?? 0) + 1);
     }
     return map;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionsKey, prefixByProject, allPrefixes, visibleProjects]);
 
   // Clear an optimistic rename once the prop session.displayName catches up.
@@ -506,6 +492,9 @@ function ProjectSidebarInner({
     if (changed) setPendingRenames(next);
   }, [sessions, pendingRenames]);
 
+  const pendingRenamesRef = useRef(pendingRenames);
+  pendingRenamesRef.current = pendingRenames;
+
   const startRename = useCallback(
     (session: DashboardSession, currentTitle: string) => {
       // Prefer the in-flight optimistic value over the prop — if the user opens
@@ -513,12 +502,12 @@ function ProjectSidebarInner({
       // the pre-rename value but we want the input to start from the latest.
       // Auto-derived displayName isn't pre-filled (user-set flag absent) — start
       // from the live title so the user types over the visible label.
-      const pending = pendingRenames.get(session.id);
+      const pending = pendingRenamesRef.current.get(session.id);
       const initial = pending ?? (session.displayNameUserSet ? (session.displayName ?? "") : "");
       setEditingSessionId(session.id);
       setEditingValue(initial || currentTitle);
     },
-    [pendingRenames],
+    [],
   );
 
   const cancelRename = () => {
@@ -1000,10 +989,6 @@ function ProjectSidebarInner({
                             : session.displayNameUserSet
                               ? (session.displayName ?? "")
                               : "";
-                        const title =
-                          effectiveDisplayName !== ""
-                            ? effectiveDisplayName
-                            : (session.branch ?? getSessionTitle(session));
                         return (
                           <div
                             key={session.id}

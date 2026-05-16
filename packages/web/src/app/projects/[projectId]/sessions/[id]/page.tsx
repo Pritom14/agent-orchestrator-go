@@ -2,13 +2,12 @@
 
 import { useEffect, useState, useCallback, useRef } from "react";
 import { useParams, usePathname, useRouter } from "next/navigation";
-import { ACTIVITY_STATE, SESSION_STATUS, isOrchestratorSession } from "@aoagents/ao-core/types";
+import { isOrchestratorSession } from "@aoagents/ao-core/types";
 import { SessionDetail } from "@/components/SessionDetail";
 import { ErrorDisplay } from "@/components/ErrorDisplay";
 import {
   type DashboardSession,
   type ActivityState,
-  type SessionStatus,
   getAttentionLevel,
 } from "@/lib/types";
 import { activityIcon } from "@/lib/activity-icons";
@@ -62,17 +61,6 @@ const SESSION_PAGE_REFRESH_INTERVAL_MS = 2000;
 const SESSION_FETCH_TIMEOUT_MS = 8000;
 const PROJECT_SESSIONS_FETCH_TIMEOUT_MS = 5000;
 const PROJECTS_FETCH_TIMEOUT_MS = 5000;
-const validSessionStatuses = new Set<string>(Object.values(SESSION_STATUS));
-const validActivityStates = new Set<string>(Object.values(ACTIVITY_STATE));
-
-function isDashboardSessionStatus(value: string): value is SessionStatus {
-  return validSessionStatuses.has(value);
-}
-
-function isActivityStateValue(value: string): value is ActivityState {
-  return validActivityStates.has(value);
-}
-
 function areProjectsEqual(previous: ProjectInfo[] | null, next: ProjectInfo[]): boolean {
   if (!previous || previous.length !== next.length) return false;
   return previous.every((p, i) => JSON.stringify(p) === JSON.stringify(next[i]));
