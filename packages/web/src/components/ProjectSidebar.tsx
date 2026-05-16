@@ -5,7 +5,7 @@ import { useState, useEffect, useMemo, useRef, useCallback, memo } from "react";
 import { useRouter } from "next/navigation";
 import { cn } from "@/lib/cn";
 import type { ProjectInfo } from "@/lib/project-name";
-import { getAttentionLevel, type DashboardSession, type AttentionLevel } from "@/lib/types";
+import { getAttentionLevel, type DashboardSession } from "@/lib/types";
 import { isOrchestratorSession } from "@aoagents/ao-core/types";
 import { getSessionTitle, humanizeBranch } from "@/lib/format";
 import { usePopoverClamp } from "@/hooks/usePopoverClamp";
@@ -982,13 +982,6 @@ function ProjectSidebarInner({
                       const isSessionActive = activeSessionId === session.id;
                       const isEditing = editingSessionId === session.id;
                       if (isEditing) {
-                        const pending = pendingRenames.get(session.id);
-                        const effectiveDisplayName =
-                          pending !== undefined
-                            ? pending
-                            : session.displayNameUserSet
-                              ? (session.displayName ?? "")
-                              : "";
                         return (
                           <div
                             key={session.id}
@@ -1048,16 +1041,7 @@ function ProjectSidebarInner({
                     </div>
                   ) : (
                     <div className="project-sidebar__empty">
-                      {!showDone && !showKilled ? (
-                        <>
-                          No active sessions
-                          <span className="project-sidebar__empty-hint">
-                            Done · killed sessions are hidden
-                          </span>
-                        </>
-                      ) : (
-                        "No sessions"
-                      )}
+                      No active sessions
                     </div>
                   )}
                 </div>

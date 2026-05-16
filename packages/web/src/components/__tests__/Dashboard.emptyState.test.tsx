@@ -166,6 +166,13 @@ describe("Dashboard empty state", () => {
   });
 
 
+  it("mounts the sidebar empty state on a fresh install with zero projects", () => {
+    render(<Dashboard initialSessions={[]} projects={[]} />);
+
+    expect(screen.getByText(/no projects yet/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /new project/i })).toBeInTheDocument();
+  });
+
   it("shows empty state when only done sessions exist", () => {
     render(
       <Dashboard
