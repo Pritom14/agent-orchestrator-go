@@ -62,6 +62,7 @@ import {
 } from "./metadata.js";
 import {
   buildLifecycleMetadataPatch,
+  clearTerminalMarkersForNonTerminalState,
   cloneLifecycle,
   createInitialCanonicalLifecycle,
   deriveLegacyStatus,
@@ -107,6 +108,7 @@ const OPENCODE_INTERACTIVE_DISCOVERY_TIMEOUT_MS = 10_000;
 // windowsHide:true suppresses the conhost popup that the shell would otherwise flash.
 const EXEC_SHELL_OPTION =
   process.platform === "win32" ? ({ shell: true, windowsHide: true } as const) : ({} as const);
+
 
 function errorIncludesSessionNotFound(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
@@ -289,6 +291,20 @@ const ENSURE_ORCHESTRATOR_CONFLICT_POLL_MS = 250;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function isAgentProcessNotDefinitelyMissing(
+  agent: Agent,
+  handle: RuntimeHandle,
+): Promise<boolean> {
+  try {
+    return (await agent.isProcessRunning(handle)) !== false;
+  } catch {
+    // Send/restore readiness should only block on a definitive "process missing"
+    // verdict. Probe failures are no verdict, so keep waiting or fall back to
+    // terminal output instead of forcing a restore.
+    return true;
+  }
 }
 
 function isFixedOrchestratorReservationError(err: unknown, sessionId: string): boolean {
@@ -479,6 +495,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       }),
     );
     updater(lifecycle);
+    clearTerminalMarkersForNonTerminalState(lifecycle);
     return lifecycle;
   }
 
@@ -1924,23 +1941,30 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         }
       }
 
-      // Persist lifecycle to disk when enrichment detected a dead runtime.
-      // enrichSessionWithRuntimeState updates the in-memory lifecycle but
-      // doesn't write to disk — without this, the stale "alive" state persists
-      // and the dashboard shows terminated sessions on the active sidebar.
+      // Persist runtime probe result to disk so the lifecycle manager sees it
+      // on next poll. We only persist the runtime signal and detecting state —
+      // the lifecycle manager's resolveProbeDecision pipeline is the single
+      // authority on terminal decisions (terminated/done). See #1735.
+      // Check the on-disk state (raw) to avoid re-writing when already
+      // detecting — enrichment sets detecting in-memory, but we only need
+      // to persist the transition once to avoid resetting lastTransitionAt.
+      const onDiskLifecycle = parseCanonicalLifecycle(raw, {
+        sessionId: sessionName,
+        status: validateStatus(raw["status"]),
+      });
       if (
         session.lifecycle &&
         (session.lifecycle.runtime.state === "missing" ||
           session.lifecycle.runtime.state === "exited") &&
-        session.lifecycle.session.state !== "terminated" &&
-        session.lifecycle.session.state !== "done"
+        onDiskLifecycle.session.state !== "terminated" &&
+        onDiskLifecycle.session.state !== "done" &&
+        onDiskLifecycle.session.state !== "detecting"
       ) {
         try {
           const persisted = buildUpdatedLifecycle(sessionName, raw, (next) => {
-            next.session.state = "terminated";
+            next.session.state = "detecting";
             next.session.reason = "runtime_lost";
-            next.session.terminatedAt = new Date().toISOString();
-            next.session.lastTransitionAt = next.session.terminatedAt;
+            next.session.lastTransitionAt = new Date().toISOString();
             next.runtime.state = session.lifecycle!.runtime.state;
             next.runtime.reason = session.lifecycle!.runtime.reason;
             next.runtime.lastObservedAt = new Date().toISOString();
@@ -2394,7 +2418,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       while (true) {
         const [runtimeAlive, processRunning, output, foregroundCommand] = await Promise.all([
           runtimePlugin.isAlive(handle).catch(() => true),
-          agentPlugin.isProcessRunning(handle).catch(() => true),
+          isAgentProcessNotDefinitelyMissing(agentPlugin, handle),
           captureOutput(handle),
           handle.runtimeName === "tmux"
             ? getTmuxForegroundCommand(handle.id)
@@ -2441,7 +2465,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       while (true) {
         const [runtimeAlive, processRunning, output, foregroundCommand] = await Promise.all([
           runtimePlugin.isAlive(handle).catch(() => true),
-          agentPlugin.isProcessRunning(handle).catch(() => true),
+          isAgentProcessNotDefinitelyMissing(agentPlugin, handle),
           captureOutput(handle),
           handle.runtimeName === "tmux"
             ? getTmuxForegroundCommand(handle.id)
@@ -2509,14 +2533,14 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
 
       let [runtimeAlive, processRunning] = await Promise.all([
         runtimePlugin.isAlive(handle).catch(() => true),
-        agentPlugin.isProcessRunning(handle).catch(() => true),
+        isAgentProcessNotDefinitelyMissing(agentPlugin, handle),
       ]);
 
       if (normalized.status === "spawning" && runtimeAlive) {
         await waitForInteractiveReadiness(normalized, SEND_BOOTSTRAP_READY_TIMEOUT_MS);
         [runtimeAlive, processRunning] = await Promise.all([
           runtimePlugin.isAlive(handle).catch(() => true),
-          agentPlugin.isProcessRunning(handle).catch(() => true),
+          isAgentProcessNotDefinitelyMissing(agentPlugin, handle),
         ]);
       }
 

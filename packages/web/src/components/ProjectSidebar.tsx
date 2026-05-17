@@ -812,6 +812,7 @@ function ProjectSidebarInner({
                 {!isDegraded ? (
                   <Link
                     href={projectHref}
+                    prefetch={false}
                     onClick={(e) => {
                       e.stopPropagation();
                       onMobileClose?.();
