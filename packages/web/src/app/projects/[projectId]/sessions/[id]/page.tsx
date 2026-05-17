@@ -156,6 +156,7 @@ export default function ProjectSessionPage() {
   const sessionFetchControllerRef = useRef<AbortController | null>(null);
   const projectSessionsFetchControllerRef = useRef<AbortController | null>(null);
   const pageUnloadingRef = useRef(false);
+  const mountedRef = useRef(true);
 
   const sseActivity = useMuxSessionActivity(id);
 
@@ -250,10 +251,21 @@ export default function ProjectSessionPage() {
         setRouteError(err instanceof Error ? err : new Error("Failed to load session"));
       }
     } finally {
-      setLoading(false);
       fetchingSessionRef.current = false;
       if (sessionFetchControllerRef.current === controller)
         sessionFetchControllerRef.current = null;
+      if (!controller.signal.aborted || hasLoadedSessionRef.current) {
+        setLoading(false);
+      } else if (mountedRef.current) {
+        // Aborted before any session was loaded and the component is still
+        // mounted — React Strict Mode fired the cleanup between mount 1 and
+        // mount 2, aborting the first fetch. Mount 2's fetchSession() was
+        // blocked by fetchingSessionRef (not yet reset). Retry immediately
+        // now that the ref is clear. mountedRef guards against the navigation-
+        // away case where the component is genuinely unmounted and we should
+        // not start a new request.
+        void fetchSession();
+      }
     }
   }, [id]);
 
@@ -344,6 +356,13 @@ export default function ProjectSessionPage() {
     return () => {
       window.removeEventListener("pagehide", mark);
       window.removeEventListener("beforeunload", mark);
+    };
+  }, []);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
     };
   }, []);
 
