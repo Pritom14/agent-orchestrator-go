@@ -430,7 +430,7 @@ function ProjectSidebarInner({
       (sessions ?? [])
         .map(
           (s) =>
-            `${s.id}:${s.status}:${s.activity ?? ""}:${s.projectId}:${s.displayName ?? ""}:${s.displayNameUserSet ? "1" : "0"}:${s.branch ?? ""}:${s.issueTitle ?? ""}:${s.pr?.title ?? ""}:${s.summary ?? ""}`,
+            `${s.id}:${s.status}:${s.activity ?? ""}:${s.projectId}:${s.displayName ?? ""}:${s.displayNameUserSet ? "1" : "0"}:${s.branch ?? ""}:${s.issueTitle ?? ""}:${s.pr?.title ?? ""}:${s.pr?.ciStatus ?? ""}:${s.pr?.reviewDecision ?? ""}:${s.pr?.mergeability ?? ""}:${s.pr?.unresolvedThreads ?? 0}:${s.summary ?? ""}`,
         )
         .join("|"),
     [sessions],
