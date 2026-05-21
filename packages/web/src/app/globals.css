@@ -1351,6 +1351,23 @@ html.light .xterm .xterm-viewport:hover::-webkit-scrollbar-thumb:active {
   text-decoration: underline;
 }
 
+/* Cost/token stat pill */
+.topbar-cost-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  background: var(--color-bg-elevated);
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+}
+.topbar-cost-pill__tokens {
+  opacity: 0.7;
+}
+
 /* Danger button variant (kill) */
 .dashboard-app-btn--danger {
   color: var(--color-status-error);

@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { humanizeBranch, getSessionTitle } from "../format";
+import { humanizeBranch, getSessionTitle, formatCost, formatTokens } from "../format";
 import type { DashboardSession } from "../types";
 
 // ---------------------------------------------------------------------------
@@ -38,6 +38,46 @@ function makeSession(overrides?: Partial<DashboardSession>): DashboardSession {
     ...overrides,
   };
 }
+
+// ---------------------------------------------------------------------------
+// formatCost
+// ---------------------------------------------------------------------------
+
+describe("formatCost", () => {
+  it("formats zero cost", () => {
+    expect(formatCost(0)).toBe("$0.00");
+  });
+
+  it("formats fractional cost to 2 decimal places", () => {
+    expect(formatCost(0.42)).toBe("$0.42");
+    expect(formatCost(1.5)).toBe("$1.50");
+    expect(formatCost(0.001)).toBe("$0.00");
+  });
+
+  it("formats larger costs", () => {
+    expect(formatCost(12.34)).toBe("$12.34");
+    expect(formatCost(100)).toBe("$100.00");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// formatTokens
+// ---------------------------------------------------------------------------
+
+describe("formatTokens", () => {
+  it("returns raw number under 1000", () => {
+    expect(formatTokens(0)).toBe("0");
+    expect(formatTokens(1)).toBe("1");
+    expect(formatTokens(999)).toBe("999");
+  });
+
+  it("returns 'Xk' at 1000 and above", () => {
+    expect(formatTokens(1000)).toBe("1k");
+    expect(formatTokens(1500)).toBe("1k");
+    expect(formatTokens(42000)).toBe("42k");
+    expect(formatTokens(999999)).toBe("999k");
+  });
+});
 
 // ---------------------------------------------------------------------------
 // humanizeBranch

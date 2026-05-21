@@ -9,6 +9,7 @@ import {
   isPRMergeReady,
 } from "@/lib/types";
 import type { ProjectInfo } from "@/lib/project-name";
+import { formatCost, formatTokens } from "@/lib/format";
 import { SessionDetailPRCard } from "./SessionDetailPRCard";
 import { askAgentToFix } from "./session-detail-agent-actions";
 import { buildGitHubBranchUrl } from "./session-detail-utils";
@@ -190,6 +191,14 @@ export function SessionDetailHeader({
             ) : (
               <span className="topbar-branch-pill">{session.branch}</span>
             )
+          ) : null}
+          {session.cost !== undefined && session.cost > 0 ? (
+            <span className="topbar-cost-pill">
+              <span>{formatCost(session.cost)}</span>
+              {session.tokens !== undefined ? (
+                <span className="topbar-cost-pill__tokens">{formatTokens(session.tokens)} tokens</span>
+              ) : null}
+            </span>
           ) : null}
           {isOrchestrator && orchestratorZones ? (
             <OrchestratorZonePills zones={orchestratorZones} />

@@ -114,6 +114,21 @@ export function getSessionTitle(session: DashboardSession): string {
   return session.status;
 }
 
+/**
+ * Format a cost in USD to 2 decimal places (e.g. "$0.42").
+ */
+export function formatCost(usd: number): string {
+  return `$${usd.toFixed(2)}`;
+}
+
+/**
+ * Format a token count: raw number under 1000, otherwise "Xk" (rounded down).
+ */
+export function formatTokens(count: number): string {
+  if (count < 1000) return String(count);
+  return `${Math.floor(count / 1000)}k`;
+}
+
 export function formatRelativeTime(input: number): string {
   const elapsedMs = Date.now() - input;
 
