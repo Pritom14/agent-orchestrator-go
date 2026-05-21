@@ -5115,6 +5115,12 @@ html.light .xterm .xterm-viewport:hover::-webkit-scrollbar-thumb:active {
   display: flex;
   align-items: center;
   gap: 6px;
+  width: 100%;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
 }
 
 .kanban-column__dot {
@@ -5144,12 +5150,43 @@ html.light .xterm .xterm-viewport:hover::-webkit-scrollbar-thumb:active {
   color: var(--color-text-muted);
 }
 
+.kanban-column__chevron {
+  width: 11px;
+  height: 11px;
+  flex-shrink: 0;
+  color: var(--color-text-muted);
+  transition: transform 0.2s ease;
+  margin-left: 4px;
+}
+
+.kanban-column__chevron--collapsed {
+  transform: rotate(-90deg);
+}
+
+/* Wrapper that drives the smooth height collapse */
+.kanban-column__body-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  display: grid;
+  grid-template-rows: 1fr;
+  transition: grid-template-rows 0.25s ease;
+}
+
+.kanban-column--collapsed .kanban-column__body-wrap {
+  grid-template-rows: 0fr;
+}
+
+/* Inner body needs min-height:0 for the grid-template-rows trick to collapse to zero */
+.kanban-column__body-wrap > .kanban-column-body {
+  min-height: 0;
+}
+
 .kanban-column__caption {
   display: none;
 }
 
 .kanban-column-body {
-  flex: 1;
   overflow-y: auto;
   padding: 6px;
 }
