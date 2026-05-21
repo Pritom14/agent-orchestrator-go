@@ -7,22 +7,22 @@ import {
 
 // Provide a full in-memory localStorage stub for each test.
 function makeStorageStub(): Storage {
-  const store: Record<string, string> = {};
+  const store = new Map<string, string>();
   return {
-    getItem: (key: string) => store[key] ?? null,
+    getItem: (key: string) => store.get(key) ?? null,
     setItem: (key: string, value: string) => {
-      store[key] = value;
+      store.set(key, value);
     },
     removeItem: (key: string) => {
-      delete store[key];
+      store.delete(key);
     },
     clear: () => {
-      for (const key of Object.keys(store)) delete store[key];
+      store.clear();
     },
     get length() {
-      return Object.keys(store).length;
+      return store.size;
     },
-    key: (index: number) => Object.keys(store)[index] ?? null,
+    key: (index: number) => [...store.keys()][index] ?? null,
   };
 }
 
