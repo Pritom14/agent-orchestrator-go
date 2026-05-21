@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { humanizeBranch, getSessionTitle } from "../format";
+import { humanizeBranch, getSessionTitle, getAgentLabel } from "../format";
 import type { DashboardSession } from "../types";
 
 // ---------------------------------------------------------------------------
@@ -351,5 +351,39 @@ describe("getSessionTitle", () => {
       metadata: { pinnedSummary: "" },
     });
     expect(getSessionTitle(session)).toBe("Live quality summary");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getAgentLabel
+// ---------------------------------------------------------------------------
+
+describe("getAgentLabel", () => {
+  it("strips -code suffix from claude-code", () => {
+    expect(getAgentLabel("claude-code")).toBe("claude");
+  });
+
+  it("returns codex unchanged", () => {
+    expect(getAgentLabel("codex")).toBe("codex");
+  });
+
+  it("returns aider unchanged", () => {
+    expect(getAgentLabel("aider")).toBe("aider");
+  });
+
+  it("returns opencode unchanged", () => {
+    expect(getAgentLabel("opencode")).toBe("opencode");
+  });
+
+  it("returns null for empty string", () => {
+    expect(getAgentLabel("")).toBeNull();
+  });
+
+  it("returns null for null", () => {
+    expect(getAgentLabel(null)).toBeNull();
+  });
+
+  it("returns null for undefined", () => {
+    expect(getAgentLabel(undefined)).toBeNull();
   });
 });

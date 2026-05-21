@@ -2948,6 +2948,14 @@ html.light .xterm .xterm-viewport:hover::-webkit-scrollbar-thumb:active {
   color: var(--color-text-muted);
 }
 
+.card__agent-badge {
+  flex-shrink: 0;
+  font-size: 9.5px;
+  font-family: var(--font-mono);
+  color: var(--color-text-secondary);
+  opacity: 0.7;
+}
+
 .session-card__control {
   display: inline-flex;
   align-items: center;

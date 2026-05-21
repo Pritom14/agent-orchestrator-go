@@ -114,6 +114,24 @@ export function getSessionTitle(session: DashboardSession): string {
   return session.status;
 }
 
+/**
+ * Return a short display label for a session's agent plugin name.
+ *
+ * Strips the `-code` suffix (so "claude-code" → "claude") and keeps other
+ * names as-is. Returns null when the input is empty or nullish.
+ *
+ * @example
+ *   getAgentLabel("claude-code")  // → "claude"
+ *   getAgentLabel("codex")        // → "codex"
+ *   getAgentLabel("aider")        // → "aider"
+ *   getAgentLabel("opencode")     // → "opencode"
+ *   getAgentLabel("")             // → null
+ */
+export function getAgentLabel(agent: string | null | undefined): string | null {
+  if (!agent) return null;
+  return agent.replace(/-code$/, "");
+}
+
 export function formatRelativeTime(input: number): string {
   const elapsedMs = Date.now() - input;
 

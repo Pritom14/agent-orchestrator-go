@@ -15,7 +15,7 @@ import {
   isDashboardSessionRestorable,
 } from "@/lib/types";
 import { cn } from "@/lib/cn";
-import { getSessionTitle } from "@/lib/format";
+import { getSessionTitle, getAgentLabel } from "@/lib/format";
 import { CICheckList } from "./CIBadge";
 import { getSizeLabel } from "./PRStatus";
 import { projectSessionHashPath, projectSessionPath } from "@/lib/routes";
@@ -313,6 +313,11 @@ function SessionCardView({ session, onSend, onKill, onMerge, onRestore }: Sessio
 
         {/* Row 3: Meta chips */}
         <div className="flex flex-wrap items-center gap-1.5 px-3.5 pb-3">
+          {getAgentLabel(session.agent) && (
+            <span className="done-meta-chip text-[var(--color-text-secondary)]">
+              {getAgentLabel(session.agent)}
+            </span>
+          )}
           {session.branch && (
             <span className="done-meta-chip font-[var(--font-mono)]">
               <svg
@@ -818,6 +823,9 @@ function SessionCardView({ session, onSend, onKill, onMerge, onRestore }: Sessio
         )}
 
         <div className="session-card__footer">
+          {getAgentLabel(session.agent) && (
+            <span className="card__agent-badge">{getAgentLabel(session.agent)}</span>
+          )}
           <span className="card__status min-w-0 truncate" title={session.userPrompt ?? undefined}>
             {!session.issueUrl && session.userPrompt
               ? session.userPrompt.length > 60
