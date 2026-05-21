@@ -2679,6 +2679,13 @@ html.light .xterm .xterm-viewport:hover::-webkit-scrollbar-thumb:active {
   color: var(--color-text-secondary);
 }
 
+.card__elapsed {
+  display: block;
+  font-size: 10px;
+  color: var(--color-text-muted);
+  line-height: 1.4;
+}
+
 .card__meta {
   display: flex;
   align-items: center;
