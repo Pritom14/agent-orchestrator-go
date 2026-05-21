@@ -674,8 +674,25 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         const detectedPR = await scm.detectPR(session, project);
         if (detectedPR) {
           session.pr = detectedPR;
+          // Eagerly update session lifecycle so the next checkSession writes a
+          // consistent lifecycle blob (pr.state=open, pr.url set) and the
+          // status-sync derives "pr_open" on the following poll without needing
+          // an extra cycle to reconcile stale pr.state="none" in the blob.
+          const nowIso = new Date().toISOString();
+          if (session.lifecycle.pr.state === "none") {
+            session.lifecycle.pr.state = "open";
+          }
+          if (session.lifecycle.pr.reason === "not_created") {
+            session.lifecycle.pr.reason = "in_progress";
+          }
+          session.lifecycle.pr.url = detectedPR.url;
+          session.lifecycle.pr.number = detectedPR.number;
+          session.lifecycle.pr.lastObservedAt = nowIso;
           const sessionsDir = getProjectSessionsDir(session.projectId);
-          updateMetadata(sessionsDir, session.id, { pr: detectedPR.url });
+          updateMetadata(sessionsDir, session.id, {
+            pr: detectedPR.url,
+            lifecycle: JSON.stringify(session.lifecycle),
+          });
           recordActivityEvent({
             projectId: session.projectId,
             sessionId: session.id,
