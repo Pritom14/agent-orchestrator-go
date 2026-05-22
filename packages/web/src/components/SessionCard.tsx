@@ -16,9 +16,22 @@ import {
 } from "@/lib/types";
 import { cn } from "@/lib/cn";
 import { getSessionTitle } from "@/lib/format";
+import { formatDuration, getElapsedMs } from "@/lib/duration";
 import { CICheckList } from "./CIBadge";
 import { getSizeLabel } from "./PRStatus";
 import { projectSessionHashPath, projectSessionPath } from "@/lib/routes";
+
+function useElapsedTime(createdAt: string): string {
+  const [elapsed, setElapsed] = useState(() => formatDuration(getElapsedMs(createdAt)));
+
+  useEffect(() => {
+    const tick = () => setElapsed(formatDuration(getElapsedMs(createdAt)));
+    const id = setInterval(tick, 60_000);
+    return () => clearInterval(id);
+  }, [createdAt]);
+
+  return elapsed;
+}
 
 /**
  * Tracks which session IDs have already played their entrance animation.
@@ -127,6 +140,7 @@ function getDoneStatusInfo(session: DashboardSession): {
 }
 
 function SessionCardView({ session, onSend, onKill, onMerge, onRestore }: SessionCardProps) {
+  const elapsedTime = useElapsedTime(session.createdAt);
   const [expanded, setExpanded] = useState(false);
   const [sendingAction, setSendingAction] = useState<string | null>(null);
   const [failedAction, setFailedAction] = useState<string | null>(null);
@@ -309,6 +323,7 @@ function SessionCardView({ session, onSend, onKill, onMerge, onRestore }: Sessio
           <p className="session-card-done__title text-[13px] font-semibold leading-snug [display:-webkit-box] [-webkit-box-orient:vertical] [-webkit-line-clamp:2] overflow-hidden">
             {title}
           </p>
+          <span className="card__elapsed mt-0.5">{elapsedTime}</span>
         </div>
 
         {/* Row 3: Meta chips */}
@@ -562,6 +577,7 @@ function SessionCardView({ session, onSend, onKill, onMerge, onRestore }: Sessio
       <div className="session-card__body flex min-h-0 flex-1 flex-col">
         <div className="card__title-wrap">
           <p className="card__title">{title}</p>
+          <span className="card__elapsed">{elapsedTime}</span>
         </div>
 
         <div className="card__meta">
