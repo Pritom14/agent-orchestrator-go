@@ -96,6 +96,9 @@ function AttentionZoneView({
     isAccordion && compactMobile && !showAll ? sessions.slice(0, 5) : sessions;
   const hiddenCount = sessions.length - visibleSessions.length;
 
+  // Must be called unconditionally before any early return to satisfy React rules of hooks.
+  const [isCollapsed, toggleCollapsed] = useKanbanCollapse(level);
+
   useEffect(() => {
     if (collapsed) {
       setShowAll(false);
@@ -166,8 +169,6 @@ function AttentionZoneView({
       </div>
     );
   }
-
-  const [isCollapsed, toggleCollapsed] = useKanbanCollapse(level);
 
   return (
     <div
