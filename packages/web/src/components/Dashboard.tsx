@@ -1,6 +1,9 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { matchesFilter } from "@/lib/session-filter";
+
+export { matchesFilter as matchesSessionFilter };
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useMediaQuery, MOBILE_BREAKPOINT } from "@/hooks/useMediaQuery";
@@ -41,17 +44,6 @@ interface DashboardProps {
 const SIMPLE_KANBAN_LEVELS = ["working", "pending", "action", "merge"] as const;
 const DETAILED_KANBAN_LEVELS = ["working", "pending", "review", "respond", "merge"] as const;
 const EMPTY_ORCHESTRATORS: DashboardOrchestratorLink[] = [];
-
-export function matchesSessionFilter(session: DashboardSession, query: string): boolean {
-  const q = query.trim().toLowerCase();
-  if (!q) return true;
-  return (
-    session.id.toLowerCase().includes(q) ||
-    (session.displayName?.toLowerCase().includes(q) ?? false) ||
-    (session.branch?.toLowerCase().includes(q) ?? false) ||
-    (session.issueTitle?.toLowerCase().includes(q) ?? false)
-  );
-}
 
 function isInputFocused(): boolean {
   const el = document.activeElement;
@@ -222,6 +214,7 @@ function DashboardInner({
   const sessionsRef = useRef(sessions);
 
   sessionsRef.current = sessions;
+
   const allProjectsView = projects.length > 1 && projectId === undefined;
   const currentProjectOrchestrator = useMemo(
     () =>
@@ -249,8 +242,8 @@ function DashboardInner({
       allProjectsView || !activeSessionId
         ? projectSessions
         : projectSessions.filter((s) => s.id === activeSessionId);
-    if (!filterQuery) return base;
-    return base.filter((s) => matchesSessionFilter(s, filterQuery));
+    if (!filterQuery.trim()) return base;
+    return base.filter((s) => matchesFilter(s, filterQuery));
   }, [projectSessions, allProjectsView, activeSessionId, filterQuery]);
 
   useEffect(() => {
@@ -574,21 +567,23 @@ function DashboardInner({
             ) : null}
             {showDebugBundleButton ? <CopyDebugBundleButton projectId={projectId} /> : null}
             <div className="dashboard-app-header__spacer" />
-            <input
-              ref={filterInputRef}
-              type="search"
-              className="dashboard-filter-input"
-              placeholder="Filter sessions…"
-              aria-label="Filter sessions"
-              value={filterQuery}
-              onChange={(e) => setFilterQuery(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Escape") {
-                  setFilterQuery("");
-                  filterInputRef.current?.blur();
-                }
-              }}
-            />
+            {!allProjectsView && (
+              <input
+                ref={filterInputRef}
+                type="search"
+                className="dashboard-filter-input"
+                placeholder="Filter sessions…"
+                aria-label="Filter sessions"
+                value={filterQuery}
+                onChange={(e) => setFilterQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") {
+                    setFilterQuery("");
+                    filterInputRef.current?.blur();
+                  }
+                }}
+              />
+            )}
             <div className="dashboard-app-header__actions">
               {!allProjectsView && orchestratorHref ? (
                 <Link
