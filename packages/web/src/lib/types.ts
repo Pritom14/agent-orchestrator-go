@@ -115,6 +115,10 @@ export interface DashboardSession {
   metadata: Record<string, string>;
   agentReportAudit?: DashboardAgentReportAuditEntry[];
   attentionLevel?: AttentionLevel;
+  /** Estimated total cost in USD (from agent's session info) */
+  cost?: number;
+  /** Total token count (input + output) */
+  tokens?: number;
 }
 
 export interface DashboardAgentReportAuditSnapshot {

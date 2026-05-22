@@ -193,6 +193,11 @@ export function sessionToDashboard(session: Session): DashboardSession {
       : null,
     metadata: session.metadata,
     agentReportAudit: [],
+    cost: session.agentInfo?.cost?.estimatedCostUsd,
+    tokens:
+      session.agentInfo?.cost !== undefined
+        ? (session.agentInfo.cost.inputTokens + session.agentInfo.cost.outputTokens)
+        : undefined,
   });
 }
 

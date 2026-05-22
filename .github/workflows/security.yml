@@ -86,6 +86,7 @@ jobs:
         uses: actions/dependency-review-action@v4
         with:
           fail-on-severity: moderate
+        continue-on-error: true # Dependency graph may not be enabled on forks
 
   npm-audit:
     name: NPM Audit
