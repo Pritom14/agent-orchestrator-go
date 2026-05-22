@@ -9,6 +9,7 @@ import {
 import { SessionCard } from "./SessionCard";
 import { getSessionTitle } from "@/lib/format";
 import { projectSessionPath } from "@/lib/routes";
+import { useKanbanCollapse } from "@/hooks/useKanbanCollapse";
 
 interface AttentionZoneProps {
   level: AttentionLevel;
@@ -95,6 +96,9 @@ function AttentionZoneView({
     isAccordion && compactMobile && !showAll ? sessions.slice(0, 5) : sessions;
   const hiddenCount = sessions.length - visibleSessions.length;
 
+  // Must be called unconditionally before any early return to satisfy React rules of hooks.
+  const [isCollapsed, toggleCollapsed] = useKanbanCollapse(level);
+
   useEffect(() => {
     if (collapsed) {
       setShowAll(false);
@@ -167,30 +171,51 @@ function AttentionZoneView({
   }
 
   return (
-    <div className="kanban-column" data-level={level}>
+    <div
+      className={`kanban-column${isCollapsed ? " kanban-column--collapsed" : ""}`}
+      data-level={level}
+    >
       <div className="kanban-column__header">
-        <div className="kanban-column__title-row">
+        <button
+          type="button"
+          className="kanban-column__title-row"
+          onClick={toggleCollapsed}
+          aria-expanded={!isCollapsed}
+          aria-controls={`kanban-body-${level}`}
+        >
           <div className="kanban-column__dot" data-level={level} />
           <span className="kanban-column__title">{config.label}</span>
           <span className="kanban-column__count">{sessions.length}</span>
-        </div>
+          <svg
+            className={`kanban-column__chevron${isCollapsed ? " kanban-column__chevron--collapsed" : ""}`}
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            viewBox="0 0 24 24"
+            aria-hidden="true"
+          >
+            <path d="m9 18 6-6-6-6" />
+          </svg>
+        </button>
       </div>
 
-      <div className="kanban-column-body">
-        {sessions.length > 0 ? (
-          <div className="kanban-column__stack">
-            {sessions.map((session) => (
-              <SessionCard
-                key={session.id}
-                session={session}
-                onSend={onSend}
-                onKill={onKill}
-                onMerge={onMerge}
-                onRestore={onRestore}
-              />
-            ))}
-          </div>
-        ) : null}
+      <div className="kanban-column__body-wrap" id={`kanban-body-${level}`}>
+        <div className="kanban-column-body">
+          {sessions.length > 0 ? (
+            <div className="kanban-column__stack">
+              {sessions.map((session) => (
+                <SessionCard
+                  key={session.id}
+                  session={session}
+                  onSend={onSend}
+                  onKill={onKill}
+                  onMerge={onMerge}
+                  onRestore={onRestore}
+                />
+              ))}
+            </div>
+          ) : null}
+        </div>
       </div>
     </div>
   );
