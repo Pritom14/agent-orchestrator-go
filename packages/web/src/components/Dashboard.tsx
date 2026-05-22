@@ -1,6 +1,9 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { matchesFilter } from "@/lib/session-filter";
+
+export { matchesFilter as matchesSessionFilter };
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useMediaQuery, MOBILE_BREAKPOINT } from "@/hooks/useMediaQuery";
@@ -41,6 +44,13 @@ interface DashboardProps {
 const SIMPLE_KANBAN_LEVELS = ["working", "pending", "action", "merge"] as const;
 const DETAILED_KANBAN_LEVELS = ["working", "pending", "review", "respond", "merge"] as const;
 const EMPTY_ORCHESTRATORS: DashboardOrchestratorLink[] = [];
+
+function isInputFocused(): boolean {
+  const el = document.activeElement;
+  if (!el) return false;
+  const tag = el.tagName.toLowerCase();
+  return tag === "input" || tag === "textarea" || (el as HTMLElement).isContentEditable;
+}
 
 function formatRelativeTimeCompact(isoDate: string | null): string {
   if (!isoDate) return "just now";
@@ -192,6 +202,8 @@ function DashboardInner({
   const [spawnErrors, setSpawnErrors] = useState<Record<string, string>>({});
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [filterQuery, setFilterQuery] = useState("");
+  const filterInputRef = useRef<HTMLInputElement>(null);
   const isMobile = useMediaQuery(MOBILE_BREAKPOINT);
   const debugParam = searchParams.get("debug");
   const showDebugBundleButton =
@@ -202,6 +214,7 @@ function DashboardInner({
   const sessionsRef = useRef(sessions);
 
   sessionsRef.current = sessions;
+
   const allProjectsView = projects.length > 1 && projectId === undefined;
   const currentProjectOrchestrator = useMemo(
     () =>
@@ -225,9 +238,13 @@ function DashboardInner({
   const currentProjectSpawnError = projectId ? (spawnErrors[projectId] ?? null) : null;
 
   const displaySessions = useMemo(() => {
-    if (allProjectsView || !activeSessionId) return projectSessions;
-    return projectSessions.filter((s) => s.id === activeSessionId);
-  }, [projectSessions, allProjectsView, activeSessionId]);
+    const base =
+      allProjectsView || !activeSessionId
+        ? projectSessions
+        : projectSessions.filter((s) => s.id === activeSessionId);
+    if (!filterQuery.trim()) return base;
+    return base.filter((s) => matchesFilter(s, filterQuery));
+  }, [projectSessions, allProjectsView, activeSessionId, filterQuery]);
 
   useEffect(() => {
     setActiveOrchestrators((current) => mergeOrchestrators(current, orchestratorLinks));
@@ -243,6 +260,17 @@ function DashboardInner({
   useEffect(() => {
     setMobileMenuOpen(false);
   }, [searchParams]);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "/" && !isInputFocused()) {
+        e.preventDefault();
+        filterInputRef.current?.focus();
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, []);
 
   const grouped = useMemo(() => {
     const zones: Record<AttentionLevel, DashboardSession[]> = {
@@ -539,6 +567,23 @@ function DashboardInner({
             ) : null}
             {showDebugBundleButton ? <CopyDebugBundleButton projectId={projectId} /> : null}
             <div className="dashboard-app-header__spacer" />
+            {!allProjectsView && (
+              <input
+                ref={filterInputRef}
+                type="search"
+                className="dashboard-filter-input"
+                placeholder="Filter sessions…"
+                aria-label="Filter sessions"
+                value={filterQuery}
+                onChange={(e) => setFilterQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") {
+                    setFilterQuery("");
+                    filterInputRef.current?.blur();
+                  }
+                }}
+              />
+            )}
             <div className="dashboard-app-header__actions">
               {!allProjectsView && orchestratorHref ? (
                 <Link

@@ -1211,6 +1211,37 @@ html.light .xterm .xterm-viewport:hover::-webkit-scrollbar-thumb:active {
   gap: 6px;
 }
 
+.dashboard-filter-input {
+  height: 27px;
+  padding: 0 8px;
+  border: 1px solid var(--color-border-default);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--color-text-primary);
+  font-size: 12px;
+  width: 160px;
+  transition: border-color 120ms ease, width 200ms ease;
+  outline: none;
+}
+
+.dashboard-filter-input::placeholder {
+  color: var(--color-text-muted);
+}
+
+.dashboard-filter-input:focus {
+  border-color: var(--color-accent);
+  width: 220px;
+}
+
+@media (max-width: 640px) {
+  .dashboard-filter-input {
+    width: 100px;
+  }
+  .dashboard-filter-input:focus {
+    width: 140px;
+  }
+}
+
 .dashboard-app-btn {
   display: inline-flex;
   align-items: center;
