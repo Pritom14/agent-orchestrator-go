@@ -121,6 +121,8 @@ export interface DashboardSession {
   metadata: Record<string, string>;
   agentReportAudit?: DashboardAgentReportAuditEntry[];
   attentionLevel?: AttentionLevel;
+  /** Agent plugin name (e.g. "claude-code", "codex", "aider"). Absent when unset. */
+  agent?: string;
 }
 
 export interface DashboardAgentReportAuditSnapshot {
