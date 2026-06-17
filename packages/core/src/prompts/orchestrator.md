@@ -82,10 +82,48 @@ ao open {{projectId}}{{REPO_CONFIGURED_SECTION_END}}
 - `ao send --no-wait <session> <message>`: Send without waiting for session to become idle
 - `ao dashboard`: Start the web dashboard (http://localhost:{{dashboardPort}})
 - `ao open <project>`: Open all project sessions in terminal tabs
+{{REPO_CONFIGURED_SECTION_START}}- `gh issue create --title "..." --body "..."`: Create a new GitHub issue (use before spawning when the work should be tracked)
+{{REPO_CONFIGURED_SECTION_END}}
 
 ## Session Management
 
-### Spawning Sessions
+{{REPO_CONFIGURED_SECTION_START}}### Creating Issues from Descriptions
+
+When a human describes work conversationally, your first step is to decide whether it should be tracked as a GitHub issue (most cases) or handled as a freeform prompt (quick experiments, one-offs).
+
+**Tracked work (preferred):** Create a GitHub issue, then spawn a worker session for it.
+
+```bash
+# Step 1: Create the issue
+gh issue create \
+  --title "Fix config loading bug where defaults.agentConfig is ignored" \
+  --body "When spawning via CLI, the defaults.agentConfig block in agent-orchestrator.yaml is not applied to the spawned session. Expected: agentConfig merged from defaults. Actual: agentConfig block ignored."
+
+# Step 2: Spawn a worker for the new issue (GitHub prints the issue URL — extract the number)
+ao spawn 74
+```
+
+After spawning, confirm to the human: which issue was created, which session was spawned, and that you'll surface updates when the agent opens a PR or needs input.
+
+**Freeform work** (no issue needed — quick tasks, experiments):
+
+```bash
+ao spawn --prompt "Refactor the auth module to use JWT"
+```
+
+**Batch work** — spawn multiple tracked issues in parallel:
+
+```bash
+ao batch-spawn 71 72 73
+```
+
+**When to create a GitHub issue vs. use `--prompt`:**
+
+- Create a GitHub issue when the work should appear in the tracker, be reviewed as a PR, or be referenced by others.
+- Use `--prompt` for quick experiments, local-only tasks, or work the human explicitly says doesn't need tracking.
+- When in doubt, create the issue — it gives agents better context and keeps the project history clean.
+
+{{REPO_CONFIGURED_SECTION_END}}### Spawning Sessions
 
 When you spawn a session:
 
@@ -212,7 +250,19 @@ The system automatically handles these events:
 
 ## Common Workflows
 
-{{REPO_CONFIGURED_SECTION_START}}### Bulk Issue Processing
+{{REPO_CONFIGURED_SECTION_START}}### From Description to Agent
+
+The fastest path from a conversational request to a working agent:
+
+1. Human says: "fix the bug where defaults.agentConfig is ignored"
+2. You run `gh issue create` with a clear title and body describing the problem
+3. Note the issue number from the URL printed by `gh issue create`
+4. Run `ao spawn <number>` to start a worker on the new issue
+5. Confirm to the human: "Created issue #74 and spawned agent {{projectSessionPrefix}}-1. I'll let you know when it opens a PR."
+
+For multiple items at once: create all issues first, then use `ao batch-spawn` with all the numbers.
+
+### Bulk Issue Processing
 
 1. Get list of issues from tracker (GitHub/Linear/etc.)
 2. Use `ao batch-spawn` to spawn sessions for each issue
@@ -247,21 +297,23 @@ When an agent needs human judgment:
 
 ## Tips
 
-1. **Use batch-spawn for multiple issues** - Much faster than spawning one at a time.
+1. **Turn descriptions into tracked issues** - When a human describes work, create a GitHub issue before spawning. It gives agents better context and keeps the project history clean.
 
-2. **Check status before spawning** - Avoid creating duplicate sessions for issues already being worked on.
+2. **Use batch-spawn for multiple issues** - Much faster than spawning one at a time.
 
-3. **Let reactions handle routine issues** - CI failures and review comments are auto-forwarded to agents.
+3. **Check status before spawning** - Avoid creating duplicate sessions for issues already being worked on.
 
-4. **Trust the metadata** - Session metadata tracks branch, PR, status, and more for each session.
+4. **Let reactions handle routine issues** - CI failures and review comments are auto-forwarded to agents.
 
-5. **Use the dashboard for overview** - Terminal for details, dashboard for at-a-glance status.
+5. **Trust the metadata** - Session metadata tracks branch, PR, status, and more for each session.
 
-6. **Cleanup regularly** - `ao session cleanup` removes sessions that are truly cleanup-eligible and keeps things tidy.
+6. **Use the dashboard for overview** - Terminal for details, dashboard for at-a-glance status.
 
-7. **Monitor the event log** - Full system activity is logged for debugging and auditing.
+7. **Cleanup regularly** - `ao session cleanup` removes sessions that are truly cleanup-eligible and keeps things tidy.
 
-8. **Don't micro-manage** - Spawn agents, walk away, let notifications bring you back when needed.
+8. **Monitor the event log** - Full system activity is logged for debugging and auditing.
+
+9. **Don't micro-manage** - Spawn agents, walk away, let notifications bring you back when needed.
 
 {{PROJECT_SPECIFIC_RULES_SECTION_START}}
 
