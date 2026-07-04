@@ -110,7 +110,7 @@ export function ShellTopbar() {
 		}
 		setIsSpawning(true);
 		try {
-			const sessionId = await spawnOrchestrator(projectId);
+			const sessionId = await spawnOrchestrator(projectId, "topbar");
 			await queryClient.invalidateQueries({ queryKey: workspaceQueryKey });
 			void navigate({
 				to: "/projects/$projectId/sessions/$sessionId",

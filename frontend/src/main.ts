@@ -756,7 +756,16 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 		stopDiscovery();
 		if (daemonProcess !== child) return;
 		daemonProcess = null;
-		if (daemonStoppingProcess === child) daemonStoppingProcess = null;
+		// An explicit stopDaemon() already set a clean `{ state: "stopped" }`.
+		// daemon-telemetry reports any status carrying a `code` as
+		// ao.renderer.daemon_failure, so don't stamp `code: "exited"` on a stop
+		// the user or app asked for — that would count intentional stops as
+		// failures. Preserve the clean stopped status instead.
+		if (daemonStoppingProcess === child) {
+			daemonStoppingProcess = null;
+			setDaemonStatus({ state: "stopped" });
+			return;
+		}
 		setDaemonStatus({
 			state: "stopped",
 			message: signal ? `Daemon exited with ${signal}` : `Daemon exited with code ${code ?? "unknown"}`,

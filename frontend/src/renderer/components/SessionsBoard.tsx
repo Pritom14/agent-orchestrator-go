@@ -9,7 +9,6 @@ import { DashboardSubhead } from "./DashboardSubhead";
 import { OrchestratorIcon } from "./icons";
 import { NewTaskDialog } from "./NewTaskDialog";
 import { spawnOrchestrator } from "../lib/spawn-orchestrator";
-import { captureRendererEvent } from "../lib/telemetry";
 import { prDiffSummary, sessionPRDisplaySummaries } from "../lib/pr-display";
 import { cn } from "../lib/utils";
 import { PRAttentionPanel, PRStatusStrip } from "./PRSummaryDisplay";
@@ -104,18 +103,13 @@ export function SessionsBoard({ projectId }: SessionsBoardProps) {
 			return;
 		}
 		setIsSpawning(true);
-		void captureRendererEvent("ao.renderer.orchestrator_spawn_requested", { project_id: projectId, source: "board" });
 		try {
-			const sessionId = await spawnOrchestrator(projectId);
-			void captureRendererEvent("ao.renderer.orchestrator_spawn_succeeded", { project_id: projectId, source: "board" });
+			const sessionId = await spawnOrchestrator(projectId, "board");
 			await queryClient.invalidateQueries({ queryKey: workspaceQueryKey });
 			void navigate({
 				to: "/projects/$projectId/sessions/$sessionId",
 				params: { projectId, sessionId },
 			});
-		} catch (error) {
-			void captureRendererEvent("ao.renderer.orchestrator_spawn_failed", { project_id: projectId, source: "board" });
-			throw error;
 		} finally {
 			setIsSpawning(false);
 		}

@@ -149,6 +149,17 @@ describe("telemetry sanitizers", () => {
 		expect(badSource).not.toHaveProperty("source");
 	});
 
+	it("keeps every whitelisted spawn source, including topbar/sidebar/project_add", async () => {
+		for (const source of ["board", "restore_dialog", "topbar", "sidebar", "project_add"]) {
+			const props = await sanitizeRendererProperties("ao.renderer.orchestrator_spawn_succeeded", {
+				project_id: "demo-project",
+				source,
+			});
+			expect(Object.keys(props).sort()).toEqual(["project_id_hash", "source"]);
+			expect(props.source).toBe(source);
+		}
+	});
+
 	it("keeps only enum values on notification events", async () => {
 		expect(await sanitizeRendererProperties("ao.renderer.notification_opened", { target: "pr" })).toEqual({
 			target: "pr",

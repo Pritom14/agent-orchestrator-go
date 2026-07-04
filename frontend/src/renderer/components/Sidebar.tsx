@@ -421,7 +421,7 @@ function ProjectItem({
 		}
 		setIsSpawning(true);
 		try {
-			const sessionId = await spawnOrchestrator(workspace.id);
+			const sessionId = await spawnOrchestrator(workspace.id, "sidebar");
 			await queryClient.invalidateQueries({ queryKey: workspaceQueryKey });
 			selection.goSession(workspace.id, sessionId);
 		} catch (err) {
