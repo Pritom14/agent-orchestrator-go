@@ -10,6 +10,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/activitydispatch"
 	agentregistry "github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/registry"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/reviewer"
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/testrunner"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/runtime/runtimeselect"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/workspace/gitworktree"
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
@@ -45,7 +46,17 @@ type lifecycleStack struct {
 // The messenger is the per-daemon agent messenger the LCM uses to nudge agents
 // in response to SCM observations (CI failure, review feedback, merge conflict).
 func startLifecycle(ctx context.Context, store *sqlite.Store, runtime ports.Runtime, messenger ports.AgentMessenger, notifier notificationSink, telemetry ports.EventSink, logger *slog.Logger) *lifecycleStack {
-	lcm := lifecycle.New(store, messenger, lifecycle.WithNotificationSink(notifier), lifecycle.WithTelemetry(telemetry))
+	opts := []lifecycle.Option{lifecycle.WithNotificationSink(notifier), lifecycle.WithTelemetry(telemetry)}
+	// Wire the post-approval sandbox test gate. It stays inert per project unless
+	// that project's config enables it, so registering the resolver here is safe
+	// even when no project uses it. A resolver build failure disables the gate
+	// rather than failing daemon boot.
+	if resolver, err := testrunner.NewResolver(); err != nil {
+		logger.Warn("lifecycle: test gate disabled, resolver build failed", "err", err)
+	} else {
+		opts = append(opts, lifecycle.WithTestRunner(ctx, resolver, store))
+	}
+	lcm := lifecycle.New(store, messenger, opts...)
 	rp := reaper.New(lcm, store, runtime, reaper.Config{Logger: logger})
 	return &lifecycleStack{LCM: lcm, reaperDone: rp.Start(ctx)}
 }

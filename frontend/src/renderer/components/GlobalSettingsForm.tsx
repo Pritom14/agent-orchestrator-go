@@ -8,7 +8,7 @@ import { UpdatesSection } from "./UpdatesSection";
 // sidebar Settings menu, not here.
 export function GlobalSettingsForm() {
 	return (
-		<div className="flex h-full min-h-0 flex-col bg-background text-foreground">
+		<div className="flex h-full min-h-0 flex-col bg-background text-foreground" data-testid="settings-page">
 			<DashboardSubhead title="Global settings" subtitle="Settings that apply across all projects" />
 			<div className="min-h-0 flex-1 overflow-y-auto p-[18px]">
 				<div className="mx-auto flex max-w-2xl flex-col gap-4">

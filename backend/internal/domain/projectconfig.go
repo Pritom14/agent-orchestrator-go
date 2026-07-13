@@ -45,6 +45,45 @@ type ProjectConfig struct {
 	// read-only toward the tracker in v1: matching issues spawn sessions, but the
 	// tracker is not commented on or transitioned.
 	TrackerIntake TrackerIntakeConfig `json:"trackerIntake,omitempty"`
+
+	// Test configures the post-review sandbox test gate. It is opt-in: when
+	// disabled (the zero value) an approved PR advances without a sandbox run.
+	Test TestConfig `json:"test,omitempty"`
+}
+
+// TestConfig configures the sandbox test gate that runs after a PR is approved.
+// A run deploys the PR branch to an isolated sandbox, runs the project's tests
+// there, and relays the pass/fail verdict back to the worker session.
+type TestConfig struct {
+	// Enabled turns the gate on. When false the whole block is inert.
+	Enabled bool `json:"enabled,omitempty"`
+	// Provider names the sandbox backend (TestProvider vocabulary, e.g.
+	// "daytona"). Required when Enabled.
+	Provider TestProvider `json:"provider,omitempty"`
+	// Snapshot is the provider snapshot/image the sandbox boots from.
+	Snapshot string `json:"snapshot,omitempty"`
+	// APIKeyEnvVar names the environment variable holding the provider API key.
+	// The key itself is never stored in config; the adapter reads it from the
+	// daemon environment at run time. Required when Enabled.
+	APIKeyEnvVar string `json:"apiKeyEnvVar,omitempty"`
+}
+
+// Validate rejects an enabled test gate that is missing the fields the runner
+// needs, so a bad config is refused when set rather than surfacing at gate time.
+func (c TestConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	if !c.Provider.IsKnown() {
+		return fmt.Errorf("test.provider: unknown provider %q", c.Provider)
+	}
+	if err := validateNoWhitespaceField("test.apiKeyEnvVar", c.APIKeyEnvVar); err != nil {
+		return err
+	}
+	if c.APIKeyEnvVar == "" {
+		return fmt.Errorf("test.apiKeyEnvVar: required when test gate is enabled")
+	}
+	return nil
 }
 
 // ReviewerConfig names one reviewer agent by harness. The harness is drawn from
@@ -135,6 +174,9 @@ func (c ProjectConfig) Validate() error {
 		}
 	}
 	if err := c.TrackerIntake.Validate(); err != nil {
+		return err
+	}
+	if err := c.Test.Validate(); err != nil {
 		return err
 	}
 	return nil

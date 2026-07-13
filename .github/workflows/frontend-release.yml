@@ -232,12 +232,67 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  # Stable-release smoke gate. After every platform has built and PUBLISHED its
+  # installers (needs: release + release-intel) but BEFORE the `latest` feed is
+  # promoted, spin a Daytona pod, install the just-published build, and run the
+  # real-app T0 Playwright suite via the external runner. The `latest`
+  # electron-updater feed — which triggers users' auto-updates — is only
+  # generated if this gate is green (publish-feed needs: e2e-gate). The runner
+  # script (scripts/ao-e2e-pod-gate.mjs) is currently a STUB; a real Daytona
+  # real-app runner is wired in separately behind the same CLI.
+  e2e-gate:
+    needs: [release, release-intel]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # required to POST a commit status via `gh api`
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Run pod smoke gate
+        id: gate
+        shell: bash
+        env:
+          DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
+        run: |
+          # Mirror how publish-feed derives the release tag: forge publishes to
+          # v<frontend/package.json version> (NOT the git tag), so read that.
+          tag="v$(node -p "require('./frontend/package.json').version")"
+          echo "gate targeting tag=$tag sha=$GITHUB_SHA"
+          node scripts/ao-e2e-pod-gate.mjs \
+            --repo "$GITHUB_REPOSITORY" \
+            --sha "$GITHUB_SHA" \
+            --tag "$tag" \
+            --suite T0
+      - name: Post ao-stable-gate commit status
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Reflect the runner's exit code as a commit status on the built SHA so
+          # the result is visible on the release commit. `if: always()` posts on
+          # both green and red; the gate step's own outcome still fails the job
+          # (and thus the publish-feed `needs` gate) when the runner exits non-zero.
+          if [ "${{ steps.gate.outcome }}" = "success" ]; then
+            state="success"
+            description="T0 pod smoke passed"
+          else
+            state="failure"
+            description="T0 pod smoke failed"
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state="$state" \
+            -f context="ao-stable-gate" \
+            -f description="$description"
+
   # After every platform has built and uploaded its installers, generate the
   # electron-updater feed (latest*.yml + .blockmap sidecars) from the versioned
   # assets and upload them to the same release. Runs once, on Linux: it only
   # hashes already-built artifacts, so it needs no per-OS runner.
   publish-feed:
-    needs: [release, release-intel]
+    needs: [release, release-intel, e2e-gate]
     runs-on: ubuntu-latest
     permissions:
       contents: write

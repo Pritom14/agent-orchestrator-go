@@ -341,6 +341,12 @@ export function Sidebar({
           12px top, 0 bottom, content-hugging button). The icon rail keeps the
           icon-only settings action plus expand toggle (off macOS). */}
 			<SidebarFooter className="relative mt-auto min-h-[51px] gap-0 overflow-hidden border-t border-border p-[7px] transition-[padding] duration-200 ease-linear group-data-[collapsible=icon]:items-center group-data-[collapsible=icon]:px-1.5">
+				{/* Always-present daemon status surface for the smoke suite: the human
+            copy lives in the Settings tooltip below, but that only mounts on
+            hover, so tests read this sr-only mirror instead. */}
+				<span className="sr-only" data-testid="daemon-status" data-state={daemonStatus.state}>
+					daemon {daemonStatus.state}
+				</span>
 				<div className="sidebar-expanded-chrome relative flex min-h-[37px] w-full min-w-[186px] items-center transition-[opacity,transform] duration-150 ease-out group-data-[collapsible=icon]:pointer-events-none group-data-[collapsible=icon]:-translate-x-2 group-data-[collapsible=icon]:opacity-0">
 					<DropdownMenu>
 						<DropdownMenuTrigger asChild>

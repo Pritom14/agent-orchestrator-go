@@ -8,7 +8,7 @@ import { OrchestratorIcon } from "./icons";
 export function BoardWelcome() {
 	const { createProject } = useShell();
 	return (
-		<div className="flex h-full min-h-0 items-center justify-center overflow-y-auto">
+		<div className="flex h-full min-h-0 items-center justify-center overflow-y-auto" data-testid="board-welcome">
 			<div className="flex w-full max-w-[460px] flex-col items-center pb-[6vh] text-center">
 				<img src={aoLogo} alt="" aria-hidden="true" className="h-20 w-20 rounded-[16px] object-cover" />
 				<h2 className="mt-5 text-[15px] font-semibold tracking-[-0.01em] text-foreground">

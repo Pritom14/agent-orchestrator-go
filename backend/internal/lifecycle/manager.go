@@ -47,6 +47,21 @@ func WithTelemetry(sink ports.EventSink) Option {
 	return func(m *Manager) { m.telemetry = sink }
 }
 
+// WithTestRunner enables the post-approval sandbox test gate. ctx is the
+// daemon-lifetime context the (asynchronous) sandbox runs execute under, so a
+// run outlives the poll cycle that started it without blocking the reducer.
+func WithTestRunner(ctx context.Context, resolver ports.TestRunnerResolver, projects projectConfigReader) Option {
+	return func(m *Manager) {
+		// Bind sendOnce with maxAttempts=0: each verdict dedups on its own
+		// (headSHA:verdict) signature — a new head SHA is a new run, so no attempt
+		// cap is needed to stop re-nudging.
+		relay := func(ctx context.Context, id domain.SessionID, prURL, key, sig, msg string) error {
+			return m.sendOnce(ctx, id, prURL, key, sig, msg, 0)
+		}
+		m.testGate = newTestGate(ctx, resolver, projects, relay)
+	}
+}
+
 // Manager reduces runtime, activity, spawn, and termination observations into durable session facts.
 // It also owns agent nudges caused by PR observations, including merge-conflict, CI-failure, and review-feedback prompts.
 type Manager struct {
@@ -59,6 +74,7 @@ type Manager struct {
 	clock     func() time.Time
 	react     reactionState
 	telemetry ports.EventSink
+	testGate  *testGate
 }
 
 // New builds a Lifecycle Manager over the session store it writes and the messenger it uses for agent nudges.

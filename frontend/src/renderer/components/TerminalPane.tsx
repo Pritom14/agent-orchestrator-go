@@ -28,6 +28,7 @@ export function TerminalPane({ session, theme, daemonReady, terminalTarget, font
 		return (
 			<pre
 				className="h-full overflow-auto bg-terminal p-4 font-mono leading-relaxed text-[var(--term-fg)]"
+				data-testid="session-terminal"
 				style={{ fontSize }}
 			>
 				<span className="text-[var(--term-dim)]">~/{session?.workspaceName ?? "reverbcode"}</span>{" "}
@@ -222,7 +223,7 @@ function AttachedTerminal({ session, theme, daemonReady, terminalTarget, fontSiz
 		: "No session selected. Pick a worker to attach its terminal.";
 
 	return (
-		<div className="flex h-full min-h-0 flex-col bg-terminal">
+		<div className="flex h-full min-h-0 flex-col bg-terminal" data-testid="session-terminal">
 			{showExitedState && (
 				<TerminalEndedStrip
 					canRestore={canRestoreSession}

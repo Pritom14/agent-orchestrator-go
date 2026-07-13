@@ -233,7 +233,7 @@ export function SessionsBoard({ projectId }: SessionsBoardProps) {
 	) : undefined;
 
 	return (
-		<div className="flex h-full min-h-0 flex-col bg-background text-foreground">
+		<div className="flex h-full min-h-0 flex-col bg-background text-foreground" data-testid="board">
 			{/* The first-launch welcome carries its own orientation; a "Board"
 			    header above it would describe a board that isn't rendered
 			    (review feedback on #2432). */}
@@ -351,6 +351,8 @@ function ZoneColumn({
 	return (
 		<section
 			className="flex min-w-0 flex-col overflow-hidden rounded-[13px]"
+			data-testid="board-column"
+			data-column={col.level}
 			style={{ background: `linear-gradient(180deg, ${col.glow}, transparent 130px), var(--kanban-column-bg)` }}
 		>
 			<div className="flex shrink-0 items-center gap-[9px] px-[15px] pb-[11px] pt-[14px]">
@@ -388,7 +390,11 @@ function SessionCard({ session, onOpen }: { session: WorkspaceSession; onOpen: (
 		onOpen();
 	};
 	return (
-		<div className="w-full rounded-[7px] border border-border bg-surface text-left transition-colors hover:border-border-strong">
+		<div
+			className="w-full rounded-[7px] border border-border bg-surface text-left transition-colors hover:border-border-strong"
+			data-testid="board-session-card"
+			data-session-id={session.id}
+		>
 			<div onClick={onOpen} onKeyDown={handleKeyDown} role="button" tabIndex={0}>
 				<div className="flex items-center gap-2 px-[13px] pb-[9px] pt-3">
 					<span className={cn("inline-flex items-center gap-1.5 text-[11px] font-medium", badge.className)}>

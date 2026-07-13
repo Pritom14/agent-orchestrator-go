@@ -51,7 +51,7 @@ export function BrowserPanelView({
 	};
 
 	return (
-		<div className="browser-panel" role="tabpanel">
+		<div className="browser-panel" data-testid="browser-panel" role="tabpanel">
 			<form className="browser-panel__toolbar" onSubmit={submit}>
 				<Button
 					aria-label="Back"
@@ -118,7 +118,11 @@ export function BrowserPanelView({
 						<p>Enter a dev-server URL to preview it here.</p>
 					</div>
 				) : null}
-				{navState.error ? <p className="browser-panel__error">{navState.error}</p> : null}
+				{navState.error ? (
+					<p className="browser-panel__error" data-testid="browser-preview-error">
+						{navState.error}
+					</p>
+				) : null}
 			</div>
 		</div>
 	);

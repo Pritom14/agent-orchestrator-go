@@ -1,0 +1,38 @@
+import { expect, test } from "@playwright/test";
+import { installFakeAgent } from "./support/fake-bridge";
+
+// BRD-* FAKE smoke suite (issue #2483). Drives the board off the fake-agent CDC
+// SSE stream so column moves and live updates exercise the same
+// SSE → invalidate → refetch path the real daemon uses (see fake-bridge.ts).
+
+const columnCard = (column: string, id: string) =>
+	`[data-testid="board-column"][data-column="${column}"] [data-session-id="${id}"]`;
+
+test("BRD-002 card moves columns when its status changes @T0 @BRD", async ({ page }) => {
+	await installFakeAgent(page, { workers: [{ id: "mover", title: "Wandering worker", status: "working" }] });
+	await page.goto("/#/");
+	await expect(page.getByTestId("board")).toBeVisible();
+	// Starts in Working.
+	await expect(page.locator(columnCard("working", "mover"))).toBeVisible();
+	await expect(page.locator(columnCard("action", "mover"))).toHaveCount(0);
+
+	// Fake agent hits waiting_input → the card must move to the "Needs you" column.
+	await page.evaluate(() => window.__aoFakeAgent!.setStatus("mover", "needs_input", "waiting_input"));
+
+	await expect(page.locator(columnCard("action", "mover"))).toBeVisible();
+	await expect(page.locator(columnCard("working", "mover"))).toHaveCount(0);
+	await expect(page.locator(columnCard("action", "mover"))).toContainText("Input needed");
+});
+
+test("BRD-006 SSE pushes card updates without a manual refresh @T0 @BRD", async ({ page }) => {
+	await installFakeAgent(page, { workers: [{ id: "live", title: "Live worker", status: "working" }] });
+	await page.goto("/#/");
+	await expect(page.locator(columnCard("working", "live"))).toContainText("Working");
+
+	// A single CDC frame (no page.reload) must repaint the card into "Ready to
+	// merge" with its new badge.
+	await page.evaluate(() => window.__aoFakeAgent!.setStatus("live", "mergeable", "idle"));
+
+	await expect(page.locator(columnCard("merge", "live"))).toBeVisible();
+	await expect(page.locator(columnCard("merge", "live"))).toContainText("Ready");
+});

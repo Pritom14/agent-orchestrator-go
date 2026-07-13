@@ -14,6 +14,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/claudecode"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/codex"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/droid"
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/fake"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/opencode"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 )
@@ -31,6 +32,7 @@ var Derivers = map[string]DeriveFunc{
 	"codex":       codex.DeriveActivityState,
 	"droid":       droid.DeriveActivityState,
 	"agy":         agy.DeriveActivityState,
+	"fake":        fake.DeriveActivityState,
 	"opencode":    opencode.DeriveActivityState,
 	"goose":       activitystate.StandardDeriveActivityState,
 	"cursor":      activitystate.StandardDeriveActivityState,

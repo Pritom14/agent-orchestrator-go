@@ -57,7 +57,7 @@ export function UpdatesSection() {
 	};
 
 	return (
-		<Card>
+		<Card data-testid="settings-section" data-section="updates">
 			<CardHeader>
 				<CardTitle className="text-[13px]">Updates</CardTitle>
 			</CardHeader>
@@ -139,7 +139,9 @@ function UpdateActions() {
 		<div className="flex flex-col gap-3 border-t border-border pt-4">
 			<div className="flex items-center gap-2 text-[12px]">
 				<span className="text-passive">Current version</span>
-				<span className="font-mono text-[11px] text-foreground">{version.data ? `v${version.data}` : "…"}</span>
+				<span className="font-mono text-[11px] text-foreground" data-testid="app-version">
+					{version.data ? `v${version.data}` : "…"}
+				</span>
 			</div>
 			<div className="flex items-center gap-3">
 				<Button type="button" variant="outline" onClick={() => void aoBridge.updates.check()} disabled={busy}>

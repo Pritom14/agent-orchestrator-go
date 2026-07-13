@@ -313,6 +313,17 @@ func (m *Manager) ApplySCMObservation(ctx context.Context, id domain.SessionID, 
 	if err := m.ApplyPRObservation(ctx, id, scmToPRObservation(o)); err != nil {
 		return err
 	}
+	// Post-approval test gate: once a PR is approved and otherwise mergeable,
+	// kick off a sandbox test run (non-blocking) whose verdict is later relayed
+	// to the worker via the same sendOnce path as CI/review nudges. Fired here,
+	// after ApplyPRObservation, because that is where the full observation
+	// (review decision + head SHA) is in hand. scmObservationIsReadyToMerge is the
+	// same predicate the ready-to-merge notification uses.
+	if m.testGate != nil && scmObservationIsReadyToMerge(o) {
+		if rec, ok, gErr := m.store.GetSession(ctx, id); gErr == nil && ok {
+			m.testGate.Consider(ctx, rec, o)
+		}
+	}
 	intent, err := m.notificationIntentForCurrentSCM(ctx, id, o)
 	if err != nil {
 		return err
