@@ -335,8 +335,7 @@ export async function installFakeAgent(page: Page, opts: FakeAgentOptions = {}):
 					const s = findSession(id);
 					if (!s) return;
 					s.previewUrl = previewUrl;
-					s.previewRevision =
-						previewRevision ?? ((typeof s.previewRevision === "number" ? s.previewRevision : 0) + 1);
+					s.previewRevision = previewRevision ?? (typeof s.previewRevision === "number" ? s.previewRevision : 0) + 1;
 					touch(s);
 					pushWorkspaces();
 				},
