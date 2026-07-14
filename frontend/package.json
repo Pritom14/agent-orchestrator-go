@@ -24,6 +24,7 @@
 		"typecheck": "tsc --noEmit",
 		"test": "vitest run --config vite.renderer.config.ts",
 		"test:e2e": "playwright test",
+		"test:e2e:t0": "playwright test --grep @T0",
 		"api:ts": "openapi-typescript ../backend/internal/httpd/apispec/openapi.yaml -o src/api/schema.ts"
 	},
 	"devDependencies": {

@@ -1,0 +1,33 @@
+import { expect, test } from "@playwright/test";
+import { installFakeBridge } from "./support/fake-bridge";
+
+// P0 — Data-directory invariant (issue #2483 P0 comment, frontend slice).
+//
+// The on-disk checks (Electron userData resolves under ~/.ao/electron, daemon
+// data under ~/.ao, no OS-default app-data writes, AO_DATA_DIR override) run in
+// the pod against a packaged build — they are not observable from the renderer.
+// What the renderer CAN attest is the daemon-readiness contract that those
+// invariants gate: a daemon only advertises its REST port once its data dir +
+// config skeleton are initialized, and the renderer reflects that as a ready
+// status and a hydrated board. This locks the renderer side of the invariant;
+// the ~/.ao filesystem assertions stay in the pod data-dir script.
+
+test("P0 renderer reflects daemon data-dir readiness @P0 @DATADIR", async ({ page }) => {
+	await installFakeBridge(page, { daemonState: "ready", daemonPort: 8080 });
+	await page.goto("/");
+
+	// A ready daemon on a port ⇒ its data dir + config skeleton initialized.
+	await expect(page.getByTestId("daemon-status")).toHaveAttribute("data-state", "ready");
+	// State backed by that data dir hydrates the board.
+	await expect(page.getByTestId("board")).toBeVisible();
+	await expect(page.getByTestId("board-session-card").first()).toBeVisible();
+});
+
+test("P0 renderer surfaces a not-ready data dir without crashing @P0 @DATADIR", async ({ page }) => {
+	// If the data dir is not ready the daemon never advertises a port; the
+	// renderer must degrade to a non-ready status, not crash.
+	await installFakeBridge(page, { daemonState: "starting" });
+	await page.goto("/");
+	await expect(page.getByTestId("daemon-status")).not.toHaveAttribute("data-state", "ready");
+	await expect(page.getByTestId("board")).toBeVisible();
+});
