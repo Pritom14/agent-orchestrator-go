@@ -251,7 +251,8 @@ jobs:
     needs: [release, release-intel]
     runs-on: ubuntu-latest
     permissions:
-      contents: write # post a commit status via gh api
+      contents: read # actions/checkout
+      statuses: write # POST the ao-stable-gate commit status (separate token scope)
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -274,11 +275,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          case "${{ steps.gate.outcome }}" in
-            success) state=success; desc="T0 pod smoke passed" ;;
-            skipped) state=success; desc="e2e gate skipped (advisory)" ;;
-            *)       state=failure; desc="T0 pod smoke failed (advisory)" ;;
-          esac
+          # Only a deliberate skip (skip_e2e_gate=true) is green. A "skipped"
+          # outcome with the input unset means an earlier step failed (e.g. the
+          # `npm --prefix scripts ci` install) and the gate never ran — that must
+          # be red, never a silent green.
+          if [ "${{ steps.gate.outcome }}" = "success" ]; then
+            state=success; desc="T0 pod smoke passed"
+          elif [ "${{ steps.gate.outcome }}" = "skipped" ] && [ "${{ inputs.skip_e2e_gate }}" = "true" ]; then
+            state=success; desc="e2e gate skipped via skip_e2e_gate"
+          else
+            state=failure; desc="T0 pod smoke failed or gate did not run"
+          fi
           gh api "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" -f state="$state" -f context="ao-stable-gate" -f description="$desc"
 
   publish-feed:

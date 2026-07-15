@@ -99,10 +99,12 @@ export function releaseDebUrl(repo, tag) {
 
 // runPodSuite spins one ephemeral Daytona pod, installs the release build, and
 // runs the real-app T0 suite in it, returning the observed facts. The pod holds
-// NO secret and needs NO egress: the .deb is fetched on the runner (public
-// asset) and uploaded in; DAYTONA_API_KEY is used only to create the pod. The
-// SDK is dynamically imported so the pure-function tests (deriveGateOutcome/
-// parseArgs) load this module without needing @daytona/sdk installed.
+// NO secret and fetches NO application code: the .deb is fetched on the runner
+// (public asset) and uploaded in; DAYTONA_API_KEY is used only to create the pod,
+// never passed into it. (boot-real.sh may still fetch its toolchain from the OS/
+// npm registries at boot unless the sandbox image has it baked — see that
+// script's header.) The SDK is dynamically imported so the pure-function tests
+// (deriveGateOutcome/parseArgs) load this module without needing @daytona/sdk.
 async function runPodSuite({ repo, tag, apiKey, timeoutMs = 20 * 60_000 }) {
 	if (!apiKey) throw new Error("DAYTONA_API_KEY is required");
 	if (!repo || !tag) throw new Error("--repo and --tag are required");
