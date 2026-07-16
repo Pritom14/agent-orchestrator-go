@@ -20,8 +20,18 @@ test("REAL-001 packaged app launches + window paints @T0 @real", async () => {
 	});
 	const win = await app.firstWindow();
 	expect(win).toBeTruthy();
-	// window has a title (renderer mounted)
-	await expect.poll(async () => (await win.title()) ?? "", { timeout: 30_000 }).not.toBeNull();
+	// Prove the renderer actually mounted AND painted real content — not just that
+	// a window object exists. Poll inside the page for: document finished loading,
+	// real DOM rendered beyond the empty index.html shell, and visible text present.
+	// (A bare `<div id="root">` from index.html is childElementCount>=1 before React
+	// runs, so we look at visible innerText, which only appears once the app paints.)
+	await expect
+		.poll(
+			() =>
+				win.evaluate(() => document.readyState === "complete" && (document.body?.innerText?.trim().length ?? 0) > 0),
+			{ timeout: 30_000, intervals: [500] },
+		)
+		.toBe(true);
 });
 
 test("REAL-002 bundled daemon reaches ready (real SQLite) @T0 @real", async () => {
