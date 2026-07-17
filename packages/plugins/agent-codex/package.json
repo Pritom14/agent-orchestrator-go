@@ -1,6 +1,6 @@
 {
   "name": "@aoagents/ao-plugin-agent-codex",
-  "version": "0.9.1",
+  "version": "0.9.3-nightly-64d81154bd7241e0f7951fa0db18b970c0749f47",
   "description": "Agent plugin: OpenAI Codex CLI",
   "license": "MIT",
   "type": "module",
