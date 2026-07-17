@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { installFakeBridge } from "./support/fake-bridge";
+import { installFakeAgent, installFakeBridge } from "./support/fake-bridge";
 
 // T0 POD smoke suite (issue #2483): the pod-runnable cases that need no fake
 // agent and no external GitHub repo. Select with `playwright test --grep @T0`
@@ -103,7 +103,16 @@ test("DMN-009 state survives a renderer relaunch @T0 @DMN", async ({ page }) => 
 	// a daemon/storage persistence check for the pod. The renderer slice we can
 	// lock: state present on the board rehydrates after a full renderer relaunch
 	// (reload), i.e. the app rebuilds from the daemon rather than in-memory state.
-	await installFakeBridge(page, { daemonState: "ready", daemonPort: 8080 });
+	//
+	// Use installFakeAgent (not installFakeBridge): its board data is read through
+	// the `window.__aoFakeAgent.snapshot()` workspace seam — the same source the
+	// real daemon fills — so the reload genuinely re-reads from the daemon-backed
+	// source. installFakeBridge alone would fall back to the static mockWorkspaces
+	// import, and the reload would pass by re-reading the same mock (false green).
+	await installFakeAgent(page, {
+		daemonPort: 8080,
+		workers: [{ id: "dmn009", title: "Persisted worker", status: "working" }],
+	});
 	await page.goto("/");
 	const firstCard = page.getByTestId("board-session-card").first();
 	await expect(firstCard).toBeVisible();

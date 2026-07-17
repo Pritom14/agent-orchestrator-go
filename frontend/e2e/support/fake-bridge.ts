@@ -75,6 +75,12 @@ export async function installFakeBridge(page: Page, opts: FakeBridgeOptions = {}
 					reload: async (viewId: string) => navState(viewId),
 					stop: async (viewId: string) => navState(viewId),
 					destroy: () => undefined,
+					// Annotation contract (mirrors src/preload.ts): useBrowserView subscribes
+					// to these whenever SessionView mounts with window.ao.browser present, so
+					// an incomplete browser shape would crash the session-detail/preview specs.
+					setAnnotationMode: async () => undefined,
+					onAnnotationSubmit: unsubscribe,
+					onAnnotationCancel: unsubscribe,
 					onNavState: unsubscribe,
 				},
 				notifications: {
@@ -398,6 +404,12 @@ export async function installFakeAgent(page: Page, opts: FakeAgentOptions = {}):
 					reload: async (viewId: string) => navState(viewId),
 					stop: async (viewId: string) => navState(viewId),
 					destroy: () => undefined,
+					// Annotation contract (mirrors src/preload.ts): useBrowserView subscribes
+					// to these whenever SessionView mounts with window.ao.browser present, so
+					// an incomplete browser shape would crash the session-detail/preview specs.
+					setAnnotationMode: async () => undefined,
+					onAnnotationSubmit: unsubscribe,
+					onAnnotationCancel: unsubscribe,
 					onNavState: unsubscribe,
 				},
 				notifications: { show: async () => undefined, onClick: unsubscribe },
