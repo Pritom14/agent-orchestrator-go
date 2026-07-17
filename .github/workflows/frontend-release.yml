@@ -250,14 +250,39 @@ jobs:
   e2e-gate:
     needs: [release, release-intel]
     runs-on: ubuntu-latest
+    # The Environment name is load-bearing: it is stamped into the GitHub OIDC
+    # token's subject (repo:<owner>/<repo>:environment:e2e-gate), which is exactly
+    # what the Azure federated credential trusts. Rename here => update the FIC.
+    environment: e2e-gate
     permissions:
       contents: read # actions/checkout
       checks: write # publish the ao-stable-gate check-run (supports a neutral conclusion)
+      id-token: write # mint the OIDC token azure/login exchanges for an Azure token
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+      # The Daytona API key lives ONLY in Azure Key Vault — never a GitHub secret.
+      # Authenticate via OIDC (no stored credential), then pull the key into the job
+      # env. Both steps are continue-on-error and guarded on the AZURE_* variables:
+      # if Azure isn't configured or is unreachable, DAYTONA_API_KEY stays unset,
+      # the gate classifies itself `infra`, and the check below is NEUTRAL (never red).
+      - name: Azure login (OIDC, no stored secret)
+        if: ${{ inputs.skip_e2e_gate != true && vars.AZURE_CLIENT_ID != '' }}
+        continue-on-error: true
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Fetch DAYTONA_API_KEY from Key Vault
+        if: ${{ inputs.skip_e2e_gate != true && vars.AZURE_CLIENT_ID != '' }}
+        continue-on-error: true
+        run: |
+          key=$(az keyvault secret show --vault-name "${{ vars.AZURE_KEYVAULT_NAME }}" --name daytona-api-key --query value -o tsv)
+          echo "::add-mask::$key"
+          { echo "DAYTONA_API_KEY<<EOF"; echo "$key"; echo "EOF"; } >> "$GITHUB_ENV"
       - name: Install pod-runner deps
         if: ${{ inputs.skip_e2e_gate != true }}
         # continue-on-error: a failed install is an infra/setup problem, not a
@@ -269,8 +294,8 @@ jobs:
         id: gate
         if: ${{ inputs.skip_e2e_gate != true }}
         continue-on-error: true
-        env:
-          DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
+        # DAYTONA_API_KEY comes from the Key Vault fetch above (in $GITHUB_ENV).
+        # If that didn't run, it's unset -> runner classifies infra -> neutral.
         run: |
           tag="v$(node -p "require('./frontend/package.json').version")"
           node scripts/ao-e2e-pod-gate.mjs --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --tag "$tag" --suite T0
