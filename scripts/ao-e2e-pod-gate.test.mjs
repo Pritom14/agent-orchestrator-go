@@ -11,7 +11,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { deriveGateOutcome, parseArgs } from "./ao-e2e-pod-gate.mjs";
+import { deriveGateOutcome, parseArgs, parsePodVerdict } from "./ao-e2e-pod-gate.mjs";
 
 test("passed -> success / exit 0", () => {
 	const o = deriveGateOutcome({ ranOk: true, testsPassed: true });
@@ -89,6 +89,41 @@ test("classification and conclusion are always from the known sets", () => {
 		assert.ok(["success", "failure", "neutral"].includes(o.conclusion));
 		assert.ok(o.exitCode === 0 || o.exitCode === 1);
 	}
+});
+
+test("parsePodVerdict: app pass / app fail / infra / missing", () => {
+	assert.deepEqual(parsePodVerdict('AO_VERDICT {"passed":true,"suite":"real-app-t0"}'), {
+		passed: true,
+		infra: false,
+	});
+	assert.deepEqual(parsePodVerdict('AO_VERDICT {"passed":false,"playwright_exit":1}'), {
+		passed: false,
+		infra: false,
+	});
+	// setup/toolchain failure must be flagged infra, not an app failure
+	assert.deepEqual(parsePodVerdict('AO_VERDICT {"passed":false,"infra":true,"stage":"npm-playwright"}'), {
+		passed: false,
+		infra: true,
+	});
+	// no verdict line at all => pod never produced a result => infra
+	assert.deepEqual(parsePodVerdict("some logs but no verdict"), { passed: false, infra: true });
+	assert.deepEqual(parsePodVerdict(""), { passed: false, infra: true });
+	// garbage json => infra, never a false app pass/fail
+	assert.deepEqual(parsePodVerdict("AO_VERDICT {not json}"), { passed: false, infra: true });
+});
+
+test("pod infra verdict maps to NEUTRAL, real app fail maps to RED", () => {
+	// This is the reviewer's core point: a pod-side setup failure (infra:true)
+	// must not be reported as a red app_failed release result.
+	const setupFail = parsePodVerdict('AO_VERDICT {"passed":false,"infra":true}');
+	const infraOutcome = deriveGateOutcome({ ranOk: !setupFail.infra, testsPassed: setupFail.passed });
+	assert.equal(infraOutcome.classification, "infra");
+	assert.equal(infraOutcome.conclusion, "neutral");
+
+	const appFail = parsePodVerdict('AO_VERDICT {"passed":false}');
+	const appOutcome = deriveGateOutcome({ ranOk: !appFail.infra, testsPassed: appFail.passed });
+	assert.equal(appOutcome.classification, "app_failed");
+	assert.equal(appOutcome.conclusion, "failure");
 });
 
 test("parseArgs reads the gate CLI flags", () => {

@@ -102,6 +102,32 @@ export function deriveGateOutcome({ ranOk, testsPassed, timedOut = false, artifa
 	};
 }
 
+/**
+ * Parse the pod's final AO_VERDICT line into { passed, infra }.
+ *
+ * The pod (test/e2e-pod/boot-real.sh) distinguishes setup/toolchain failures
+ * (apt/npm/dpkg) from the real app-test result:
+ *   {"passed":true}               -> app smoke passed
+ *   {"passed":false}              -> app smoke failed (a real app failure)
+ *   {"passed":false,"infra":true} -> setup problem (must NOT be a red app failure)
+ * A missing or unparseable verdict means the pod never produced a result at all,
+ * which is itself infra (the suite could not run), never an app failure.
+ *
+ * @param {string} out combined pod stdout/stderr
+ * @returns {{passed:boolean, infra:boolean}}
+ */
+export function parsePodVerdict(out) {
+	const m = (out ?? "").match(/AO_VERDICT (\{.*\})\s*$/m);
+	if (!m) return { passed: false, infra: true };
+	let v;
+	try {
+		v = JSON.parse(m[1]);
+	} catch {
+		return { passed: false, infra: true };
+	}
+	return { passed: v.passed === true, infra: v.infra === true };
+}
+
 // GitHub release Linux .deb URL for a tag. Forge publishes to v<version>; the
 // asset is agent-orchestrator_<version>_amd64.deb (version = tag without "v").
 export function releaseDebUrl(repo, tag) {
@@ -145,9 +171,8 @@ async function runPodSuite({ repo, tag, apiKey, timeoutMs = 20 * 60_000 }) {
 		);
 		const out = r.result ?? "";
 		process.stdout.write(out);
-		const m = out.match(/AO_VERDICT (\{.*\})\s*$/m);
-		const passed = m ? JSON.parse(m[1]).passed === true : false;
-		return { passed, timedOut: Date.now() - startedAt >= timeoutMs, artifacts: null };
+		const { passed, infra } = parsePodVerdict(out);
+		return { passed, infra, timedOut: Date.now() - startedAt >= timeoutMs, artifacts: null };
 	} finally {
 		if (sandbox) await sandbox.delete().catch(() => {});
 	}
@@ -166,8 +191,10 @@ async function main(argv) {
 			tag: args.tag,
 			apiKey: process.env.DAYTONA_API_KEY,
 		});
+		// A pod-side setup/toolchain failure (res.infra) is NOT a release result:
+		// map it to ranOk:false so it becomes a NEUTRAL infra outcome, not red.
 		outcome = deriveGateOutcome({
-			ranOk: true,
+			ranOk: !res.infra,
 			testsPassed: res.passed,
 			timedOut: res.timedOut,
 			artifactsUrl: res.artifacts,
