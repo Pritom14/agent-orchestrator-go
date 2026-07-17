@@ -81,7 +81,16 @@ test("DMN-001 daemon spawns on app start and reaches ready @T0 @DMN", async ({ p
 test("DMN-002 daemon health is reflected in the renderer @T0 @DMN", async ({ page }) => {
 	// A responsive daemon → the renderer is ready AND has data to paint: the
 	// board hydrates with sessions rather than an error/empty shell.
-	await installFakeBridge(page, { daemonState: "ready", daemonPort: 8080 });
+	//
+	// Use installFakeAgent so the session card is served through the
+	// window.__aoFakeAgent.snapshot() workspace seam (the daemon-backed source),
+	// not the static mockWorkspaces fallback — otherwise the card would render
+	// regardless of the daemon and the "daemon → has data" link would be a false
+	// green.
+	await installFakeAgent(page, {
+		daemonPort: 8080,
+		workers: [{ id: "dmn002", title: "Active worker", status: "working" }],
+	});
 	await page.goto("/");
 	await expect(page.getByTestId("daemon-status")).toHaveAttribute("data-state", "ready");
 	await expect(page.getByTestId("board-session-card").first()).toBeVisible();
