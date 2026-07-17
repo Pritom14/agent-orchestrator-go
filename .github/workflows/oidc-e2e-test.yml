@@ -1,0 +1,60 @@
+name: oidc-keyvault-e2e-test
+
+# Standalone end-to-end test of the OIDC -> Key Vault -> gate chain, isolated from
+# the full release pipeline. Dispatch it manually; it authenticates to Azure via
+# OIDC (no stored secret), pulls DAYTONA_API_KEY from the vault, and runs the real
+# pod gate against a published build. continue-on-error is intentionally OFF here
+# so every link fails loudly during testing.
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: repo whose release .deb to test
+        default: AgentWrapper/agent-orchestrator
+      target_tag:
+        description: release tag to test
+        default: v0.10.4-nightly.202607161413
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    # Must match the Azure federated-credential subject:
+    # repo:Pritom14/agent-orchestrator-go:environment:e2e-gate
+    environment: e2e-gate
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout gate branch (has the runner + pod harness)
+        uses: actions/checkout@v4
+        with:
+          ref: feat/stable-e2e-gate
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Azure login (OIDC, no stored secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Fetch DAYTONA_API_KEY from Key Vault
+        run: |
+          echo "vault: ${{ vars.AZURE_KEYVAULT_NAME }}"
+          key=$(az keyvault secret show --vault-name "${{ vars.AZURE_KEYVAULT_NAME }}" --name daytona-api-key --query value -o tsv)
+          echo "::add-mask::$key"
+          { echo "DAYTONA_API_KEY<<EOF"; echo "$key"; echo "EOF"; } >> "$GITHUB_ENV"
+          echo "fetched key: ${#key} chars"
+
+      - name: Install pod-runner deps
+        run: npm --prefix scripts ci
+
+      - name: Run pod gate against the target build
+        run: |
+          node scripts/ao-e2e-pod-gate.mjs \
+            --repo "${{ inputs.target_repo }}" \
+            --sha "$GITHUB_SHA" \
+            --tag "${{ inputs.target_tag }}" \
+            --suite T0
