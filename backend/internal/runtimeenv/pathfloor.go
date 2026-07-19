@@ -11,6 +11,13 @@
 // fail with "tmux required on macOS/Linux but not in PATH" even though tmux is
 // installed. This package ports the static floor to Go so the daemon repairs its
 // own PATH at startup. See AgentWrapper/agent-orchestrator#2812.
+//
+// Scope: this ports only the STATIC floor from shell-env.ts, not its login-shell
+// probe ($SHELL -ilc -> env). The floor covers the common Homebrew and
+// /usr/local case #2812 reports, but not custom prefixes the Electron probe
+// recovers (Nix ~/.nix-profile/bin, asdf/mise shims, or any non-standard dir), so
+// a non-Electron daemon remains less PATH-robust than the Electron-launched one
+// for those setups. Porting the login-shell probe is a possible future follow-up.
 package runtimeenv
 
 import (
