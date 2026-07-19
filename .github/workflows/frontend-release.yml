@@ -288,22 +288,25 @@ jobs:
           # data-plane call needing no subscription; passing one would make az try
           # to select a subscription it can't see. Least privilege = vault-only.
           allow-no-subscriptions: true
-      - name: Fetch DAYTONA_API_KEY from Key Vault
-        # After `npm ci` on purpose (see above): the key enters $GITHUB_ENV only
-        # for the gate step that follows, never for dependency installation.
-        if: ${{ inputs.skip_e2e_gate != true && vars.AZURE_CLIENT_ID != '' }}
-        continue-on-error: true
-        run: |
-          key=$(az keyvault secret show --vault-name "${{ vars.AZURE_KEYVAULT_NAME }}" --name daytona-api-key --query value -o tsv)
-          echo "::add-mask::$key"
-          { echo "DAYTONA_API_KEY<<EOF"; echo "$key"; echo "EOF"; } >> "$GITHUB_ENV"
       - name: Run pod e2e gate (advisory)
         id: gate
         if: ${{ inputs.skip_e2e_gate != true }}
         continue-on-error: true
-        # DAYTONA_API_KEY comes from the Key Vault fetch above (in $GITHUB_ENV).
-        # If that didn't run, it's unset -> runner classifies infra -> neutral.
         run: |
+          # Fetch the Daytona key and scope it to THIS step ONLY: it is a local
+          # shell variable exported to the node process, never written to
+          # $GITHUB_ENV — so no later step (artifact upload, check publish, the
+          # blocking enforce step, or anything added below) can ever see it.
+          # `az` is already authenticated by the Azure login step above. When Azure
+          # isn't configured the key stays empty and the runner classifies the run
+          # as infra -> NEUTRAL (never red).
+          if [ -n "${{ vars.AZURE_CLIENT_ID }}" ]; then
+            DAYTONA_API_KEY=$(az keyvault secret show --vault-name "${{ vars.AZURE_KEYVAULT_NAME }}" --name daytona-api-key --query value -o tsv 2>/dev/null || true)
+            if [ -n "$DAYTONA_API_KEY" ]; then
+              echo "::add-mask::$DAYTONA_API_KEY"
+              export DAYTONA_API_KEY
+            fi
+          fi
           tag="v$(node -p "require('./frontend/package.json').version")"
           node scripts/ao-e2e-pod-gate.mjs --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --tag "$tag" --suite T0
       - name: Upload e2e artifacts
