@@ -41,19 +41,15 @@ jobs:
           # no subscription-id: vault read is data-plane; SP has no subscription RBAC
           allow-no-subscriptions: true
 
-      - name: Fetch DAYTONA_API_KEY from Key Vault
-        run: |
-          echo "vault: ${{ vars.AZURE_KEYVAULT_NAME }}"
-          key=$(az keyvault secret show --vault-name "${{ vars.AZURE_KEYVAULT_NAME }}" --name daytona-api-key --query value -o tsv)
-          echo "::add-mask::$key"
-          { echo "DAYTONA_API_KEY<<EOF"; echo "$key"; echo "EOF"; } >> "$GITHUB_ENV"
-          echo "fetched key: ${#key} chars"
-
       - name: Install pod-runner deps
         run: npm --prefix scripts ci
 
       - name: Run pod gate against the target build
         run: |
+          # step-local: exported to node only, never written to $GITHUB_ENV
+          DAYTONA_API_KEY=$(az keyvault secret show --vault-name "${{ vars.AZURE_KEYVAULT_NAME }}" --name daytona-api-key --query value -o tsv 2>/dev/null || true)
+          if [ -n "$DAYTONA_API_KEY" ]; then echo "::add-mask::$DAYTONA_API_KEY"; export DAYTONA_API_KEY; fi
+          echo "key present: $([ -n "$DAYTONA_API_KEY" ] && echo yes || echo no)"
           node scripts/ao-e2e-pod-gate.mjs \
             --repo "${{ inputs.target_repo }}" \
             --sha "$GITHUB_SHA" \
