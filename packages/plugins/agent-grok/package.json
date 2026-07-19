@@ -1,6 +1,6 @@
 {
   "name": "@aoagents/ao-plugin-agent-grok",
-  "version": "0.1.3",
+  "version": "0.1.4-nightly-fdb158224d8f899543ae56c48ea0b307a2762a8a",
   "description": "Agent plugin: Grok",
   "license": "MIT",
   "type": "module",
