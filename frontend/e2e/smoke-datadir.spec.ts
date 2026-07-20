@@ -1,10 +1,12 @@
 import { expect, test } from "@playwright/test";
 import { installFakeAgent, installFakeBridge } from "./support/fake-bridge";
 
-// P0 — Data-directory invariant (issue #2483, RENDERER SLICE). dev:web + fake
+// Data-directory invariant (issue #2483, RENDERER SLICE). dev:web + fake
 // bridge — this asserts only the renderer's readiness reflection, NOT the on-disk
-// ~/.ao layout or the real daemon/storage; real-boundary coverage is the
-// packaged-app pod gate (#2697), not here.
+// ~/.ao layout or the real daemon/storage. The on-disk boundary is exercised only
+// in the packaged-app pod gate (#2697), which today runs a boot-level smoke (app
+// launches, daemon ready), NOT the full ~/.ao layout assertion — that stays in
+// the pod data-dir script as future per-case work.
 //
 // The on-disk checks (Electron userData resolves under ~/.ao/electron, daemon
 // data under ~/.ao, no OS-default app-data writes, AO_DATA_DIR override) run in
@@ -15,7 +17,7 @@ import { installFakeAgent, installFakeBridge } from "./support/fake-bridge";
 // status and a hydrated board. This locks the renderer side of the invariant;
 // the ~/.ao filesystem assertions stay in the pod data-dir script.
 
-test("P0 renderer reflects daemon data-dir readiness @P0 @DATADIR", async ({ page }) => {
+test("renderer: reflects daemon data-dir readiness @P0 @DATADIR", async ({ page }) => {
 	// Use installFakeAgent so the board card is served through the
 	// window.__aoFakeAgent.snapshot() workspace seam — the daemon-backed source —
 	// not the static mockWorkspaces fallback. Otherwise the card assertion below
@@ -33,7 +35,7 @@ test("P0 renderer reflects daemon data-dir readiness @P0 @DATADIR", async ({ pag
 	await expect(page.getByTestId("board-session-card").first()).toBeVisible();
 });
 
-test("P0 renderer surfaces a not-ready data dir without crashing @P0 @DATADIR", async ({ page }) => {
+test("renderer: surfaces a not-ready data dir without crashing @P0 @DATADIR", async ({ page }) => {
 	// If the data dir is not ready the daemon never advertises a port; the
 	// renderer must degrade to a non-ready status, not crash.
 	await installFakeBridge(page, { daemonState: "starting" });

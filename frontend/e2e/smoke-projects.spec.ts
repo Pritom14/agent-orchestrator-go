@@ -4,11 +4,14 @@ import { expect, test } from "@playwright/test";
 //
 // Scope: runs under `dev:web` against lib/mock-data.ts fixtures. It verifies the
 // renderer surfaces (sidebar row + board render) only — NOT project registration
-// through the real daemon/filesystem. Real-boundary coverage is the packaged-app
-// pod gate (#2697). Case IDs cross-reference the #2483 catalog; not a claim of
-// full-boundary coverage, and this suite is not the canonical T0/P0 gate.
+// through the real daemon/filesystem. That boundary is exercised only in the
+// packaged-app pod gate (#2697), which today runs a boot-level smoke (app
+// launches, daemon ready), NOT this case — per-case pod coverage is future work.
+// Case IDs cross-reference the #2483 catalog; not a claim of full-boundary
+// coverage, and this suite is not the canonical T0/P0 gate.
 
-test("PRJ-005 added project appears in the sidebar and board @T0 @PRJ", async ({ page }) => {
+// #2483 PRJ-005.
+test("renderer: added project appears in the sidebar and board @T0 @PRJ", async ({ page }) => {
 	// dev:web serves lib/mock-data.ts (ao-demo, docs-site). A registered project
 	// must show as a sidebar row AND drive the board it opens.
 	await page.goto("/#/");

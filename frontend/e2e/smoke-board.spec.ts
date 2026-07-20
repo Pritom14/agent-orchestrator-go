@@ -2,15 +2,18 @@ import { expect, test } from "@playwright/test";
 import { installFakeAgent } from "./support/fake-bridge";
 
 // BRD-* RENDERER SMOKE (issue #2483, renderer slice). dev:web + fake bridge —
-// does NOT hit the real daemon/storage/API/preload/PTY/FS; real-boundary coverage
-// is the packaged-app pod gate (#2697), not here. Drives the board off the
-// fake-agent CDC SSE stream so column moves and live updates exercise the same
-// SSE → invalidate → refetch path the real daemon uses (see fake-bridge.ts).
+// does NOT hit the real daemon/storage/API/preload/PTY/FS. Those boundaries are
+// exercised only in the packaged-app pod gate (#2697), which today runs a
+// boot-level smoke (app launches, daemon ready), NOT these cases — per-case pod
+// coverage is future work. Drives the board off the fake-agent CDC SSE stream so
+// column moves and live updates exercise the same SSE → invalidate → refetch
+// path the real daemon uses (see fake-bridge.ts). IDs cross-reference #2483.
 
 const columnCard = (column: string, id: string) =>
 	`[data-testid="board-column"][data-column="${column}"] [data-session-id="${id}"]`;
 
-test("BRD-002 card moves columns when its status changes @T0 @BRD", async ({ page }) => {
+// #2483 BRD-002.
+test("renderer: card moves columns when its status changes @T0 @BRD", async ({ page }) => {
 	await installFakeAgent(page, { workers: [{ id: "mover", title: "Wandering worker", status: "working" }] });
 	await page.goto("/#/");
 	await expect(page.getByTestId("board")).toBeVisible();
@@ -26,7 +29,8 @@ test("BRD-002 card moves columns when its status changes @T0 @BRD", async ({ pag
 	await expect(page.locator(columnCard("action", "mover"))).toContainText("Input needed");
 });
 
-test("BRD-006 SSE pushes card updates without a manual refresh @T0 @BRD", async ({ page }) => {
+// #2483 BRD-006.
+test("renderer: SSE pushes card updates without a manual refresh @T0 @BRD", async ({ page }) => {
 	await installFakeAgent(page, { workers: [{ id: "live", title: "Live worker", status: "working" }] });
 	await page.goto("/#/");
 	await expect(page.locator(columnCard("working", "live"))).toContainText("Working");
