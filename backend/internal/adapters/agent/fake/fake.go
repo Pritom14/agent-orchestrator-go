@@ -1,18 +1,31 @@
 // Package fake implements a deterministic, LLM-free agent harness. It exists so
-// e2e tests can drive the full session lifecycle (spawning -> active ->
-// waiting_input -> active -> done) without a real CLI, a network round-trip, or
-// any token spend.
+// e2e tests can drive the FULL session lifecycle without a real CLI, a network
+// round-trip, or any token spend. The timeline the script walks is:
 //
-// The launch command is a small POSIX shell script that walks a fixed timeline:
-// it prints canned marker lines to its pane and calls `ao hooks fake <event>`
-// at each phase, exactly the way real agents report activity through their
-// native hooks. The daemon pins the session PATH to its own binary and sets
-// AO_SESSION_ID/AO_DATA_DIR, so the bare `ao` in the script reaches the daemon
-// and its activity reports land against the spawning session.
+//	spawning -> active -> waiting_input -> active -> blocked -> done (exited)
+//
+// with a canned PR-push event emitted during the active work phase. This is the
+// event set issue #2483's fake-agent prerequisite (#2) calls for: spawning,
+// active, waiting_input, blocked, done, and a PR push.
+//
+// The launch command is a small POSIX shell script that walks that fixed
+// timeline: it prints canned marker lines to its pane and calls
+// `ao hooks fake <event>` at each phase, exactly the way real agents report
+// activity through their native hooks. The daemon pins the session PATH to its
+// own binary and sets AO_SESSION_ID/AO_DATA_DIR, so the bare `ao` in the script
+// reaches the daemon and its activity reports land against the spawning session.
+//
+// The terminal state is deterministic: the run ends on a `session-end` event
+// that derives ActivityExited (a durable, is_terminated fact), NOT an incidental
+// idle left behind by a trailing `stop`. A turn-boundary event (session-end)
+// also clears the sticky `blocked` state that precedes it, so the lifecycle
+// reaches its terminal cleanly without needing the pre/post-tool-use trio.
 //
 // Timing is controlled by AO_FAKE_SPEEDUP (a float, default 1): every phase
 // sleeps for a base duration divided by the speedup, so tests can compress the
-// whole run into well under a second (issue prereq #4, clock control).
+// whole run into well under a second (issue prereq #4, clock control). There is
+// no trailing sleep after the terminal event, so a high speedup collapses the
+// entire run to a handful of near-zero sleeps plus process spawn overhead.
 package fake
 
 import (
@@ -33,14 +46,11 @@ import (
 // value <= 0 or unparseable falls back to 1 (real-time base durations).
 const SpeedupEnv = "AO_FAKE_SPEEDUP"
 
-// basePhaseSeconds is how long each timeline phase lasts at speedup 1. Five
-// phases (spawning, active, waiting_input, active, done tail) give an ~10s run
-// unspeeded, which AO_FAKE_SPEEDUP compresses for tests.
+// basePhaseSeconds is how long each timeline phase lasts at speedup 1. The
+// timeline has six sleeping phases (spawning, active, waiting_input, active,
+// pr-push, blocked) — the terminal session-end fires with no trailing sleep —
+// for an ~12s run unspeeded, which AO_FAKE_SPEEDUP compresses for tests.
 const basePhaseSeconds = 2.0
-
-// getenv is a seam so tests can control the speedup without mutating the
-// process environment.
-var getenv = os.Getenv
 
 // Plugin is the fake agent adapter. It holds no state and is safe for
 // concurrent use.
@@ -119,29 +129,48 @@ func (p *Plugin) ResolveBinary(ctx context.Context) (string, error) {
 // DeriveActivityState maps a fake hook sub-command name onto an AO activity
 // state. The bool is false when the event carries no activity signal. It is the
 // deriver registered for the "fake" token in activitydispatch, and it mirrors
-// the events timelineScript emits:
+// the events timelineScript emits, chosen so the fake can exercise every
+// activity state a real agent reports:
 //
-//   - session-start / user-prompt-submit → active
-//   - permission-request                 → waiting_input
-//   - stop                               → idle
+//   - session-start / user-prompt-submit / pr-push → active
+//   - agent-needs-input                            → waiting_input
+//   - permission-request                           → blocked
+//   - stop                                         → idle
+//   - session-end                                  → exited (terminal)
+//
+// The waiting_input / blocked split mirrors the canonical claude-code deriver:
+// agent-needs-input is a request for the next INSTRUCTION (safe to nudge), while
+// permission-request is a pending DECISION dialog (blocked — a stray keystroke
+// could answer it). A fake session can safely map permission-request to blocked
+// even without the pre/post-tool-use trio because it always follows the dialog
+// with a turn-boundary event (session-end), which lifecycle uses to clear the
+// sticky block. stop is retained for completeness (a mid-turn idle) though the
+// timeline itself ends on session-end so the terminal state is a durable exit,
+// not an ageable idle.
 func DeriveActivityState(event string, _ []byte) (domain.ActivityState, bool) {
 	switch event {
-	case "session-start", "user-prompt-submit":
+	case "session-start", "user-prompt-submit", "pr-push":
 		return domain.ActivityActive, true
-	case "permission-request":
+	case "agent-needs-input":
 		return domain.ActivityWaitingInput, true
+	case "permission-request":
+		return domain.ActivityBlocked, true
 	case "stop":
 		return domain.ActivityIdle, true
+	case "session-end":
+		return domain.ActivityExited, true
 	default:
 		return "", false
 	}
 }
 
 // phaseSleep resolves the per-phase sleep duration in seconds from
-// AO_FAKE_SPEEDUP, defaulting to basePhaseSeconds at speedup 1.
+// AO_FAKE_SPEEDUP, defaulting to basePhaseSeconds at speedup 1. It reads the
+// process environment directly; tests control it with t.Setenv, which restores
+// it automatically — there is no mutable package-level seam to leak across tests.
 func phaseSleep() float64 {
 	speedup := 1.0
-	if raw := strings.TrimSpace(getenv(SpeedupEnv)); raw != "" {
+	if raw := strings.TrimSpace(os.Getenv(SpeedupEnv)); raw != "" {
 		if parsed, err := strconv.ParseFloat(raw, 64); err == nil && parsed > 0 {
 			speedup = parsed
 		}
@@ -152,27 +181,40 @@ func phaseSleep() float64 {
 // timelineScript builds the POSIX shell script the fake runs. Each `ao hooks`
 // call takes its stdin from /dev/null (the hook reads a payload from stdin) and
 // swallows output, and is guarded with `|| true` so a missing/unreachable
-// daemon never fails the fake mid-timeline. The states, in order:
+// daemon never fails the fake mid-timeline. The phases, in order, and the
+// activity state each drives (see DeriveActivityState):
 //
-//	(launch) spawning -> active -> waiting_input -> active -> done
+//	(launch) spawning -> active -> waiting_input -> active[+pr-push] -> blocked -> done
 //
-// The leading sleep leaves the session in its pre-activity spawning state long
-// enough to be observed before the first hook flips it to active.
+// spawning is the pre-hook window (a sleep with no hook) so the session can be
+// observed in its spawn state before the first hook flips it to active. The
+// pr-push event fires during the active work phase — the canned "pushed PR"
+// marker plus a `pr-push` hook (which derives active, so it refreshes rather
+// than changes state). The run ENDS on session-end (derives exited), a
+// turn-boundary event that both clears the sticky `blocked` and terminates the
+// session — a deterministic terminal, not an ageable idle. No trailing sleep
+// follows the terminal event, so a high AO_FAKE_SPEEDUP collapses the whole run.
 func timelineScript(sleepSeconds float64) string {
 	d := formatSeconds(sleepSeconds)
 	var b strings.Builder
-	line := func(marker, event string) {
+	// phase prints a canned marker, optionally fires a hook, and (unless it is
+	// the terminal phase) sleeps to keep the derived state observable.
+	phase := func(marker, event string, sleep bool) {
 		fmt.Fprintf(&b, "printf '%%s\\n' 'fake-agent: %s'\n", marker)
 		if event != "" {
 			fmt.Fprintf(&b, "ao hooks fake %s </dev/null >/dev/null 2>&1 || true\n", event)
 		}
-		fmt.Fprintf(&b, "sleep %s\n", d)
+		if sleep {
+			fmt.Fprintf(&b, "sleep %s\n", d)
+		}
 	}
-	line("spawning", "")
-	line("active", "session-start")
-	line("waiting for input", "permission-request")
-	line("active", "user-prompt-submit")
-	line("done", "stop")
+	phase("spawning", "", true)
+	phase("active", "session-start", true)
+	phase("waiting for input", "agent-needs-input", true)
+	phase("active", "user-prompt-submit", true)
+	phase("pushed PR", "pr-push", true)
+	phase("blocked", "permission-request", true)
+	phase("done", "session-end", false)
 	return b.String()
 }
 
