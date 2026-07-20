@@ -113,15 +113,22 @@ export function deriveGateOutcome({ ranOk, testsPassed, timedOut = false, artifa
  * A missing or unparseable verdict means the pod never produced a result at all,
  * which is itself infra (the suite could not run), never an app failure.
  *
+ * The pod may emit more than one AO_VERDICT line (e.g. a retry, or a later
+ * stage that overrides an earlier optimistic result). The FINAL line is the
+ * authoritative one — the pod's last word on the run — so we select the LAST
+ * match, never the first, otherwise a stale passing line could mask a later
+ * failure.
+ *
  * @param {string} out combined pod stdout/stderr
  * @returns {{passed:boolean, infra:boolean}}
  */
 export function parsePodVerdict(out) {
-	const m = (out ?? "").match(/AO_VERDICT (\{.*\})\s*$/m);
-	if (!m) return { passed: false, infra: true };
+	const matches = [...(out ?? "").matchAll(/^.*AO_VERDICT (\{.*\})\s*$/gm)];
+	if (matches.length === 0) return { passed: false, infra: true };
+	const last = matches[matches.length - 1];
 	let v;
 	try {
-		v = JSON.parse(m[1]);
+		v = JSON.parse(last[1]);
 	} catch {
 		return { passed: false, infra: true };
 	}
@@ -162,16 +169,20 @@ async function runPodSuite({ repo, tag, apiKey, suite, artifactsDir, timeoutMs =
 	validateGateArgs({ apiKey, repo, tag });
 
 	const podDir = join(dirname(fileURLToPath(import.meta.url)), "..", "test", "e2e-pod");
-	const debUrl = releaseDebUrl(repo, tag);
-	const res = await fetch(debUrl);
-	if (!res.ok) throw new Error(`download ${debUrl} -> HTTP ${res.status}`);
-	const deb = Buffer.from(await res.arrayBuffer());
-
-	const { Daytona } = await import("@daytona/sdk");
-	const daytona = new Daytona({ apiKey });
+	// Captured pod output. Written to pod.log on EVERY exit path (success, app
+	// failure, infra, exception) by the finally below, so the uploaded artifact
+	// is never silently absent — a missing log would hide why a run went neutral.
+	let podLog = "";
 	let sandbox;
 	const startedAt = Date.now();
 	try {
+		const debUrl = releaseDebUrl(repo, tag);
+		const res = await fetch(debUrl);
+		if (!res.ok) throw new Error(`download ${debUrl} -> HTTP ${res.status}`);
+		const deb = Buffer.from(await res.arrayBuffer());
+
+		const { Daytona } = await import("@daytona/sdk");
+		const daytona = new Daytona({ apiKey });
 		sandbox = await daytona.create({ snapshot: process.env.AO_DAYTONA_SNAPSHOT || "daytona-small" });
 		await sandbox.fs.uploadFile(deb, "/home/daytona/app.deb");
 		for (const f of ["playwright.electron.config.ts", "real-app.spec.ts", "boot-real.sh"]) {
@@ -184,28 +195,40 @@ async function runPodSuite({ repo, tag, apiKey, suite, artifactsDir, timeoutMs =
 			undefined,
 			Math.floor(timeoutMs / 1000),
 		);
-		const out = r.result ?? "";
-		process.stdout.write(out);
-		// Persist artifacts BEFORE teardown: the full pod log always, plus the
-		// Playwright results tarball if the pod produced one. Best-effort — artifact
-		// capture never fails the gate.
+		podLog = r.result ?? "";
+		process.stdout.write(podLog);
+		// Pull the Playwright results tarball if the pod produced one. Best-effort
+		// and must run BEFORE teardown in the finally. The pod log itself is always
+		// persisted (finally), so a missing tarball never loses the run record.
+		if (artifactsDir) {
+			try {
+				const tgz = await sandbox.fs.downloadFile("/home/daytona/artifacts.tgz");
+				if (tgz) {
+					mkdirSync(artifactsDir, { recursive: true });
+					writeFileSync(join(artifactsDir, "artifacts.tgz"), Buffer.isBuffer(tgz) ? tgz : Buffer.from(tgz));
+				}
+			} catch {
+				/* no results tarball produced; the pod log is still saved below */
+			}
+		}
+		const { passed, infra } = parsePodVerdict(podLog);
+		return { passed, infra, timedOut: Date.now() - startedAt >= timeoutMs };
+	} catch (err) {
+		// Record WHY the log is short so the always-uploaded pod.log is never a
+		// silent empty file on an infra/exception path.
+		if (!podLog) podLog = `ao-e2e-pod-gate: run failed before the pod produced output: ${err.message}\n`;
+		throw err;
+	} finally {
+		// ALWAYS write the pod log — on green, red, infra, or exception — so the
+		// artifact upload has something to attach on every run.
 		if (artifactsDir) {
 			try {
 				mkdirSync(artifactsDir, { recursive: true });
-				writeFileSync(join(artifactsDir, "pod.log"), out);
-				try {
-					const tgz = await sandbox.fs.downloadFile("/home/daytona/artifacts.tgz");
-					if (tgz) writeFileSync(join(artifactsDir, "artifacts.tgz"), Buffer.isBuffer(tgz) ? tgz : Buffer.from(tgz));
-				} catch {
-					/* no results tarball produced; the pod log is still saved */
-				}
+				writeFileSync(join(artifactsDir, "pod.log"), podLog || "(no pod output captured)\n");
 			} catch {
-				/* artifact capture is best-effort */
+				/* artifact capture is best-effort — never fail the gate on it */
 			}
 		}
-		const { passed, infra } = parsePodVerdict(out);
-		return { passed, infra, timedOut: Date.now() - startedAt >= timeoutMs };
-	} finally {
 		if (sandbox) await sandbox.delete().catch(() => {});
 	}
 }
@@ -244,6 +267,17 @@ async function main(argv) {
 		});
 	} catch (err) {
 		console.error(`ao-e2e-pod-gate: run failed: ${err.message}`);
+		// Guarantee a pod.log exists even when the run threw before the pod could
+		// produce one (e.g. missing DAYTONA_API_KEY, or a throw before runPodSuite's
+		// own finally): the artifact upload must never find an empty dir silently.
+		try {
+			mkdirSync(artifactsDir, { recursive: true });
+			writeFileSync(join(artifactsDir, "pod.log"), `ao-e2e-pod-gate: run failed (infra/setup): ${err.message}\n`, {
+				flag: "wx",
+			});
+		} catch {
+			/* pod.log already written by runPodSuite, or best-effort — ignore */
+		}
 		outcome = deriveGateOutcome({ ranOk: false, artifactsUrl: runUrl });
 	}
 

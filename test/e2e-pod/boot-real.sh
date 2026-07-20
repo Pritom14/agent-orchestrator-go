@@ -58,18 +58,59 @@ fi
 command -v xvfb-run >/dev/null 2>&1 || fail_infra "xvfb-missing" "xvfb-run unavailable after install"
 
 echo "== install release build: $DEB =="
-# dpkg unpacks the package's files even if dependency configuration is deferred;
-# apt-get -f then resolves runtime deps (best-effort — a registry hiccup here does
-# not by itself condemn the build). The authoritative check is whether the package
-# actually installed a runnable app binary, below.
-dpkg_rc=0
-sudo dpkg -i "$DEB" >/dev/null 2>&1 || dpkg_rc=$?
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -f -qq >/dev/null 2>&1 || true
+# Guard against a STALE binary masquerading as a fresh install: drop any
+# pre-existing agent-orchestrator so the ONLY binary that can satisfy the check
+# below is one THIS .deb installs. Trusting `command -v` alone would let a broken
+# package pass against a leftover binary on PATH.
+if command -v agent-orchestrator >/dev/null 2>&1; then
+	sudo rm -f "$(command -v agent-orchestrator)" 2>/dev/null || true
+fi
+sudo rm -f /usr/lib/agent-orchestrator/agent-orchestrator 2>/dev/null || true
+
+# dpkg -i unpacks the package's files; runtime-dependency *configuration* may be
+# deferred to apt-get -f below (dpkg then exits non-zero with "dependency
+# problems"). But a dpkg failure that is NOT a mere dependency deferral (corrupt
+# archive, wrong architecture, unpack or maintainer-script error) means the
+# RELEASE PACKAGE itself is broken -> app_failed (RED, INS-001), not infra.
+dpkg_out="$(sudo dpkg -i "$DEB" 2>&1)"
+dpkg_rc=$?
+echo "$dpkg_out"
+if [ "$dpkg_rc" != 0 ] && ! printf '%s' "$dpkg_out" | grep -qiE 'dependency problems'; then
+	fail_app "package-install" "dpkg -i could not unpack/install the release .deb (rc=$dpkg_rc)"
+fi
+
+# Resolve the deferred runtime deps. A failure here has TWO distinct causes that
+# must NOT be conflated:
+#   - the apt registry/network is unreachable (fetch/resolve/connect errors) =
+#     INFRA (neutral): a Daytona/registry outage, not the build's fault.
+#   - the package's declared deps are genuinely unsatisfiable = app_failed (RED):
+#     a real problem with the release .deb.
+apt_out="$(sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -f -qq 2>&1)"
+apt_rc=$?
+echo "$apt_out"
+if [ "$apt_rc" != 0 ]; then
+	if printf '%s' "$apt_out" | grep -qiE 'could not resolve|failed to fetch|temporary failure|unable to connect|could not connect|network is unreachable|connection timed out|cannot initiate the connection'; then
+		fail_infra "apt-install-fix" "apt-get -f install could not reach the registry/network"
+	fi
+	fail_app "package-deps" "release .deb declares dependencies that cannot be satisfied (apt-get -f rc=$apt_rc)"
+fi
+
+# Authoritative install check: the package must be registered as installed AND
+# must OWN the resolved binary (dpkg -s / dpkg -L) — not merely resolve to some
+# binary on PATH. This is what makes a stale/foreign binary unable to green a
+# broken package.
+if ! dpkg -s agent-orchestrator >/dev/null 2>&1; then
+	fail_app "package-install" "agent-orchestrator is not registered as installed after dpkg/apt (dpkg rc=$dpkg_rc)"
+fi
 APP="$(command -v agent-orchestrator || echo /usr/lib/agent-orchestrator/agent-orchestrator)"
-# A missing/non-executable app binary means the RELEASE PACKAGE is broken or
-# uninstallable — a product/build failure (INS-001), not infra. Fail RED.
 if [ ! -x "$APP" ]; then
-	fail_app "package-install" "release .deb did not install a runnable app binary (dpkg rc=$dpkg_rc, path=$APP)"
+	fail_app "package-install" "release .deb installed no runnable app binary (dpkg rc=$dpkg_rc, path=$APP)"
+fi
+# Confirm the resolved binary is a file the package owns (following symlinks).
+APP_REAL="$(readlink -f "$APP" 2>/dev/null || echo "$APP")"
+if ! dpkg -L agent-orchestrator 2>/dev/null | grep -qxF "$APP" &&
+	! dpkg -L agent-orchestrator 2>/dev/null | grep -qxF "$APP_REAL"; then
+	fail_app "package-install" "resolved binary $APP is not owned by the agent-orchestrator package (stale/foreign binary)"
 fi
 echo "app: $APP (dpkg rc=$dpkg_rc)"
 

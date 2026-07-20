@@ -309,6 +309,17 @@ jobs:
           fi
           tag="v$(node -p "require('./frontend/package.json').version")"
           node scripts/ao-e2e-pod-gate.mjs --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --tag "$tag" --suite T0
+      - name: Azure logout (revoke az auth for the rest of the job)
+        # azure/login leaves `az` authenticated for the WHOLE job, so any later
+        # step (upload, check publish, enforce) could re-run `az keyvault secret
+        # show` and re-fetch DAYTONA_API_KEY even though the env var is
+        # step-local. Clearing the auth here — always(), so it runs even if the
+        # gate step failed — makes the secret genuinely unreachable afterwards.
+        if: ${{ always() && inputs.skip_e2e_gate != true }}
+        continue-on-error: true
+        run: |
+          az logout || true
+          az account clear || true
       - name: Upload e2e artifacts
         # The runner saves the pod log + Playwright results tarball to e2e-artifacts/
         # before tearing the sandbox down. Attaching them to the run is what the
@@ -318,7 +329,10 @@ jobs:
         with:
           name: ao-stable-gate-artifacts
           path: e2e-artifacts/
-          if-no-files-found: ignore
+          # The runner always writes e2e-artifacts/pod.log (on green, red, infra,
+          # and exception paths), so a missing artifact is genuinely anomalous —
+          # surface it as a warning rather than swallowing it silently.
+          if-no-files-found: warn
       - name: Publish ao-stable-gate check
         if: always()
         env:
