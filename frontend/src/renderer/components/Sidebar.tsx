@@ -310,7 +310,7 @@ export function Sidebar({
 				{/* Always-present daemon status mirror for the smoke suite: no visible
 				    daemon-state copy is guaranteed to be mounted elsewhere. */}
 				{daemonStatus && (
-					<span className="sr-only" data-testid="daemon-status" data-state={daemonStatus.state}>
+					<span aria-hidden="true" className="sr-only" data-testid="daemon-status" data-state={daemonStatus.state}>
 						daemon {daemonStatus.state}
 					</span>
 				)}

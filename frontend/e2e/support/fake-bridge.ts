@@ -1,5 +1,8 @@
 import type { Page } from "@playwright/test";
 
+import type { AoBridge } from "../../src/preload";
+import type { DaemonStatus } from "../../src/shared/daemon-status";
+
 // The e2e suite runs the renderer under `dev:web` (VITE_NO_ELECTRON=1) with no
 // Electron preload, so `window.ao` is undefined and lib/bridge.ts falls back to
 // a browser stub that reports the daemon as permanently "stopped" and the app
@@ -40,7 +43,8 @@ export async function installFakeBridge(page: Page, opts: FakeBridgeOptions = {}
 	await page.addInitScript(
 		({ version, daemonState, daemonPort }) => {
 			const unsubscribe = () => () => undefined;
-			const status = daemonState === "ready" ? { state: "ready", port: daemonPort } : { state: daemonState };
+			const status: DaemonStatus =
+				daemonState === "ready" ? { state: "ready", port: daemonPort } : { state: daemonState };
 			const navState = (viewId: string) => ({
 				viewId,
 				url: "",
@@ -53,7 +57,7 @@ export async function installFakeBridge(page: Page, opts: FakeBridgeOptions = {}
 			// Full AoBridge surface (mirrors src/preload.ts) so any renderer call
 			// resolves — an incomplete object would throw the moment the app touched
 			// a missing method.
-			(window as unknown as { ao: unknown }).ao = {
+			const ao = {
 				app: {
 					getVersion: async () => version,
 					chooseDirectory: async () => null,
@@ -110,7 +114,7 @@ export async function installFakeBridge(page: Page, opts: FakeBridgeOptions = {}
 					setMigration: async () => undefined,
 				},
 				updateSettings: {
-					get: async () => ({ enabled: false, channel: "latest", nightlyAck: false }),
+					get: async () => ({ enabled: false, channel: "latest", nightlyAck: false, feature: null }),
 					set: async () => undefined,
 				},
 				updates: {
@@ -120,7 +124,14 @@ export async function installFakeBridge(page: Page, opts: FakeBridgeOptions = {}
 					install: async () => undefined,
 					onStatus: unsubscribe,
 				},
-			};
+				// UpdatesSection calls featureBuilds.getActive() immediately on mount; an
+				// omitted namespace would surface as a swallowed React Query error.
+				featureBuilds: {
+					list: async () => [],
+					getActive: async () => null,
+				},
+			} satisfies AoBridge;
+			(window as unknown as { ao: unknown }).ao = ao;
 		},
 		{ version, daemonState, daemonPort },
 	);
@@ -384,7 +395,7 @@ export async function installFakeAgent(page: Page, opts: FakeAgentOptions = {}):
 			(window as unknown as { __aoFakeAgent: unknown }).__aoFakeAgent = controller;
 
 			const unsubscribe = () => () => undefined;
-			const status = { state: "ready", port: daemonPort };
+			const status: DaemonStatus = { state: "ready", port: daemonPort };
 			const navState = (viewId: string, url = "", error?: string) => ({
 				viewId,
 				url,
@@ -394,7 +405,7 @@ export async function installFakeAgent(page: Page, opts: FakeAgentOptions = {}):
 				isLoading: false,
 				...(error ? { error } : {}),
 			});
-			(window as unknown as { ao: unknown }).ao = {
+			const ao = {
 				app: {
 					getVersion: async () => version,
 					chooseDirectory: async () => null,
@@ -441,7 +452,7 @@ export async function installFakeAgent(page: Page, opts: FakeAgentOptions = {}):
 				notifications: { show: async () => undefined, onClick: unsubscribe },
 				appState: { getMigration: async () => ({ status: "completed" }), setMigration: async () => undefined },
 				updateSettings: {
-					get: async () => ({ enabled: false, channel: "latest", nightlyAck: false }),
+					get: async () => ({ enabled: false, channel: "latest", nightlyAck: false, feature: null }),
 					set: async () => undefined,
 				},
 				updates: {
@@ -451,7 +462,14 @@ export async function installFakeAgent(page: Page, opts: FakeAgentOptions = {}):
 					install: async () => undefined,
 					onStatus: unsubscribe,
 				},
-			};
+				// UpdatesSection calls featureBuilds.getActive() immediately on mount; an
+				// omitted namespace would surface as a swallowed React Query error.
+				featureBuilds: {
+					list: async () => [],
+					getActive: async () => null,
+				},
+			} satisfies AoBridge;
+			(window as unknown as { ao: unknown }).ao = ao;
 		},
 		{ version, daemonPort, projectId, projectName, platform, workers },
 	);
