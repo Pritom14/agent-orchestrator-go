@@ -16,6 +16,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/droid"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/fake"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/opencode"
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/vibe"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 )
 
@@ -44,6 +45,7 @@ var Derivers = map[string]DeriveFunc{
 	"kiro":        activitystate.StandardDeriveActivityState,
 	"kilocode":    activitystate.StandardDeriveActivityState,
 	"autohand":    activitystate.StandardDeriveActivityState,
+	"vibe":        vibe.DeriveActivityState,
 	"fake":        fake.DeriveActivityState,
 }
 

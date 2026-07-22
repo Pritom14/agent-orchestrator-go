@@ -26,6 +26,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/push"
 	"github.com/aoagents/agent-orchestrator/backend/internal/runfile"
 	agentsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/agent"
+	devimportsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/devimport"
 	importsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/importer"
 	notificationsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/notification"
 	projectsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/project"
@@ -117,14 +118,29 @@ func Run() error {
 	// Bring up the Lifecycle Manager and the reaper first: it makes the session
 	// lifecycle write path live (reducer write -> store -> DB trigger ->
 	// change_log -> poller -> broadcaster) and gives startSession the shared LCM.
-	lcStack := startLifecycle(ctx, store, runtimeAdapter, messenger, notificationWriter, telemetrySink, log)
+	// The agent resolver is built before the LCM so lifecycle can consume the
+	// adapter-declared active-turn steering capability; startSession reuses it.
+	defaultAgent := cfg.Agent
+	if defaultAgent == "" {
+		defaultAgent = config.DefaultAgent
+	}
+	agents, err := buildAgentResolver(defaultAgent, log)
+	if err != nil {
+		stop()
+		if cdcErr := cdcPipe.Stop(); cdcErr != nil {
+			log.Error("cdc pipeline shutdown", "err", cdcErr)
+		}
+		return fmt.Errorf("wire agent resolver: %w", err)
+	}
+
+	lcStack := startLifecycle(ctx, store, runtimeAdapter, messenger, notificationWriter, telemetrySink, agents, log)
 	lcStack.scmDone = startSCMObserver(ctx, store, lcStack.LCM, log)
 
 	// Wire the controller-facing session service over the same store + LCM, the
 	// selected runtime, a gitworktree workspace, the per-session agent resolver
 	// (AO_AGENT validated here for compatibility), and the agent messenger, then mount it
 	// on the API.
-	sessionSvc, reviewSvc, sessMgr, err := startSession(cfg, runtimeAdapter, store, lcStack.LCM, messenger, telemetrySink, log)
+	sessionSvc, reviewSvc, sessMgr, err := startSession(cfg, runtimeAdapter, store, lcStack.LCM, messenger, telemetrySink, agents, log)
 	if err != nil {
 		stop()
 		lcStack.Stop()
@@ -188,11 +204,18 @@ func Run() error {
 		NotificationStream: notificationHub,
 		Push:               pushRegistry,
 		Import:             importsvc.New(importsvc.Deps{Store: store}),
-		CDC:                store,
-		Events:             cdcPipe.Broadcaster,
-		Activity:           lcStack.LCM,
-		Telemetry:          telemetrySink,
-		Mobile:             mc,
+		DevImport: devimportsvc.New(devimportsvc.Deps{
+			Store:         store,
+			TargetDataDir: cfg.DataDir,
+			OpenSource: func(ctx context.Context, dataDir string) (devimportsvc.SourceStore, error) {
+				return sqlite.OpenReadOnly(ctx, dataDir)
+			},
+		}),
+		CDC:       store,
+		Events:    cdcPipe.Broadcaster,
+		Activity:  lcStack.LCM,
+		Telemetry: telemetrySink,
+		Mobile:    mc,
 	})
 	if err != nil {
 		stop()
@@ -224,6 +247,12 @@ func Run() error {
 	if reconcileErr := sessMgr.Reconcile(ctx); reconcileErr != nil {
 		log.Error("reconcile sessions on boot failed", "err", reconcileErr)
 	}
+
+	// Redeliver any worker_idle events left pending across the restart, now that
+	// sessions (and their orchestrators) have been reconciled. Off the critical
+	// boot path (a store read plus a possible pane write per pending project);
+	// the recovery sweep is the backstop if it does not finish before shutdown.
+	go lcStack.LCM.DispatchAllPendingWorkerIdleEvents(ctx)
 
 	// ponytail: 5s tolerates a brief frontend restart; tune if dev hot-reload trips it.
 	const supervisorGrace = 5 * time.Second
