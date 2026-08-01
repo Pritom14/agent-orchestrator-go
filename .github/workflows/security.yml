@@ -84,6 +84,7 @@ jobs:
 
       - name: Dependency Review
         uses: actions/dependency-review-action@v4
+        continue-on-error: true # Dependency graph is not enabled on this repo; informational only
         with:
           fail-on-severity: moderate
 
