@@ -98,6 +98,33 @@ describe("generateOrchestratorPrompt", () => {
     expect(prompt).toContain("No repository remote is configured.");
   });
 
+  it("teaches gh issue create → ao spawn workflow when repo is configured", async () => {
+    const generateOrchestratorPrompt = await loadGenerateOrchestratorPrompt();
+    const prompt = generateOrchestratorPrompt({
+      config,
+      projectId: "my-app",
+      project: config.projects["my-app"]!,
+    });
+
+    expect(prompt).toContain("gh issue create");
+    expect(prompt).toContain("Creating Issues from Descriptions");
+    expect(prompt).toContain("From Description to Agent");
+  });
+
+  it("omits issue-creation workflow when repo is not configured", async () => {
+    const generateOrchestratorPrompt = await loadGenerateOrchestratorPrompt();
+    const noRepoProject = { ...config.projects["my-app"]!, repo: undefined };
+    const prompt = generateOrchestratorPrompt({
+      config,
+      projectId: "my-app",
+      project: noRepoProject,
+    });
+
+    expect(prompt).not.toContain("gh issue create");
+    expect(prompt).not.toContain("Creating Issues from Descriptions");
+    expect(prompt).not.toContain("From Description to Agent");
+  });
+
   it("pushes implementation and PR claiming into worker sessions", async () => {
     const generateOrchestratorPrompt = await loadGenerateOrchestratorPrompt();
     const prompt = generateOrchestratorPrompt({
