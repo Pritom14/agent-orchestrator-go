@@ -904,6 +904,91 @@ describe("check (single session)", () => {
     expect(lm.getStates().get("app-1")).toBe("stuck");
   });
 
+  it("writes lifecycle blob with pr.state=open immediately when detectPR finds a PR", async () => {
+    const pr = makePR({ owner: "org", repo: "my-app", number: 42 });
+    const mockSCM = createMockSCM({
+      detectPR: vi.fn().mockResolvedValue(pr),
+      enrichSessionsPRBatch: vi.fn().mockResolvedValue(new Map()),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({
+        status: "working",
+        branch: "feat/new-feature",
+        pr: null,
+        workspacePath: null,
+        metadata: { agent: "mock-agent" },
+      }),
+      metaOverrides: { branch: "feat/new-feature", agent: "mock-agent" },
+      registry,
+    });
+
+    await lm.check("app-1");
+
+    expect(mockSCM.detectPR).toHaveBeenCalledOnce();
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta?.["pr"]).toBe(pr.url);
+
+    // Lifecycle blob must be written immediately with pr.state=open so the next
+    // poll can derive "pr_open" without an extra reconciliation cycle.
+    const lifecycle = JSON.parse(meta?.["lifecycle"] ?? "{}");
+    expect(lifecycle.pr?.state).toBe("open");
+    expect(lifecycle.pr?.url).toBe(pr.url);
+    expect(lifecycle.pr?.number).toBe(pr.number);
+  });
+
+  it("transitions to pr_open status on the next check after detectPR finds a PR", async () => {
+    const pr = makePR({ owner: "org", repo: "my-app", number: 42 });
+    const mockSCM = createMockSCM({
+      detectPR: vi.fn().mockResolvedValueOnce(pr).mockResolvedValue(null),
+      enrichSessionsPRBatch: vi.fn().mockResolvedValue(new Map()),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+
+    const session = makeSession({
+      status: "working",
+      branch: "feat/new-feature",
+      pr: null,
+      workspacePath: null,
+      metadata: { agent: "mock-agent" },
+    });
+    const lm = setupCheck("app-1", {
+      session,
+      metaOverrides: { branch: "feat/new-feature", agent: "mock-agent" },
+      registry,
+    });
+
+    // First check: detectPR finds PR, lifecycle blob written with pr.state=open
+    await lm.check("app-1");
+    expect(lm.getStates().get("app-1")).toBe("working");
+
+    // Second check: session loaded with lifecycle blob having pr.state=open → pr_open
+    const metaAfterFirst = readMetadataRaw(env.sessionsDir, "app-1");
+    const updatedSession = makeSession({
+      ...session,
+      status: "pr_open",
+      pr,
+      branch: "feat/new-feature",
+      metadata: { ...session.metadata, pr: pr.url, lifecycle: metaAfterFirst?.["lifecycle"] ?? "" },
+    });
+    updatedSession.lifecycle.pr.state = "open";
+    updatedSession.lifecycle.pr.url = pr.url;
+    updatedSession.lifecycle.pr.number = pr.number;
+    vi.mocked(mockSessionManager.get).mockResolvedValue(updatedSession);
+
+    await lm.check("app-1");
+    expect(lm.getStates().get("app-1")).toBe("pr_open");
+  });
+
   it("refreshes worker branch metadata from the current worktree HEAD before PR detection", async () => {
     const workspacePath = join(env.tmpDir, "worker-ws");
     const gitDir = join(env.tmpDir, "repo", ".git", "worktrees", "app-1");
