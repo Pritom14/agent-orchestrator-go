@@ -194,6 +194,7 @@ export function sessionToDashboard(session: Session): DashboardSession {
       : null,
     metadata: session.metadata,
     agentReportAudit: [],
+    agent: session.metadata["agent"],
   });
 }
 
